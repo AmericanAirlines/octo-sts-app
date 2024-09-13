@@ -116,6 +116,10 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 		return nil, status.Errorf(codes.InvalidArgument, "invalid bearer token: %v", err)
 	}
 
+	if issuer != "https://token.actions.githubusercontent.com" {
+		return nil, status.Errorf(codes.PermissionDenied, "invalid issuer")
+	}
+
 	// Fetch the provider from the cache or create a new one and add to the cache
 	p, err := provider.Get(ctx, issuer)
 	if err != nil {
