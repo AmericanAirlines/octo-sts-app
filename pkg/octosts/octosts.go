@@ -20,7 +20,7 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/google/go-github/v61/github"
+	"github.com/google/go-github/v62/github"
 	lru "github.com/hashicorp/golang-lru/v2"
 	expirablelru "github.com/hashicorp/golang-lru/v2/expirable"
 
@@ -150,7 +150,8 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 	}
 
 	verifier := p.Verifier(&oidc.Config{
-		ClientID: s.domain,
+		// The audience is verified later on by the trust policy.
+		SkipClientIDCheck: true,
 	})
 	tok, err := verifier.Verify(ctx, bearer)
 	if err != nil {
@@ -170,7 +171,7 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 	clog.FromContext(ctx).Infof("trust policy: %#v", e.TrustPolicy)
 
 	// Check the token against the federation rules.
-	e.Actor, err = e.TrustPolicy.CheckToken(tok)
+	e.Actor, err = e.TrustPolicy.CheckToken(tok, s.domain)
 	if err != nil {
 		clog.FromContext(ctx).Warnf("token does not match trust policy: %v", err)
 		return nil, err
