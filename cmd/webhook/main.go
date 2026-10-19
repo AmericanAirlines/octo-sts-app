@@ -66,6 +66,7 @@ func main() {
 		kmsKey = baseCfg.KMSKeys[0]
 	} else {
 		log.Panic("at least one KMS key must be provided")
+	}
 	
 	atr, err := ghtransport.New(ctx, appID, kmsKey, baseCfg, client)
 	if err != nil {
