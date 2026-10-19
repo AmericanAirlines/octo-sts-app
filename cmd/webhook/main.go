@@ -67,7 +67,6 @@ func main() {
 	} else {
 		log.Panic("at least one KMS key must be provided")
 	}
-
 	atr, err := ghtransport.New(ctx, appID, kmsKey, baseCfg, client)
 	if err != nil {
 		log.Panicf("error creating GitHub App transport for app %d: %v", appID, err)
