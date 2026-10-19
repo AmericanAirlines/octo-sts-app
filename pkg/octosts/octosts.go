@@ -4,24 +4,33 @@
 package octosts
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httputil"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"github.com/cenkalti/backoff/v5"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/google/go-github/v84/github"
+	"github.com/google/go-github/v88/github"
+	lru "github.com/hashicorp/golang-lru/v2"
 	expirablelru "github.com/hashicorp/golang-lru/v2/expirable"
 
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -34,43 +43,165 @@ import (
 	"github.com/octo-sts/app/pkg/ghtransport"
 	"github.com/octo-sts/app/pkg/oidcvalidate"
 	"github.com/octo-sts/app/pkg/provider"
+	"github.com/octo-sts/app/pkg/routekey"
+	"github.com/octo-sts/app/pkg/stickystore"
 )
 
 const (
 	retryDelay = 10 * time.Millisecond
 	maxRetry   = 3
+	// maxInheritedRateLimitRejoins bounds how many times a policy-read waiter
+	// re-reads on its own installation after inheriting another
+	// installation's rate limit from a shared flight.
+	maxInheritedRateLimitRejoins = 3
+	negativeCacheConst           = ""
 )
 
-func NewSecurityTokenServiceServer(im, rrm ghinstall.Manager, appCount int, ceclient cloudevents.Client, domain string, metrics bool) pboidc.SecurityTokenServiceServer {
+// NewSecurityTokenServiceServer creates an STS that exchanges OIDC tokens for
+// GitHub installation tokens. router selects the per-org app pool; sticky (may
+// be nil) persists checks:write routing for check-run ownership across all
+// pools (installation IDs are globally unique within GitHub).
+func NewSecurityTokenServiceServer(router *ghinstall.OrgRouter, sticky stickystore.Store, apps AppSet, ceclient cloudevents.Client, domain string, metrics bool, baseURL string, orgPolicyRepo string, policyDir string, allowedIssuers []string) pboidc.SecurityTokenServiceServer {
 	return &sts{
-		im:       im,
-		rrm:      rrm,
-		appCount: appCount,
-		ceclient: ceclient,
-		domain:   domain,
-		metrics:  metrics,
+		router:         router,
+		sticky:         sticky,
+		apps:           apps,
+		ceclient:       ceclient,
+		domain:         domain,
+		metrics:        metrics,
+		baseURL:        baseURL,
+		orgPolicyRepo:  orgPolicyRepo,
+		policyDir:      policyDir,
+		allowedIssuers: allowedIssuers,
 	}
 }
 
 var trustPolicies = expirablelru.NewLRU[cacheTrustPolicyKey, string](200, nil, time.Minute*5)
+var staleTrustPolicies = expirablelru.NewLRU[cacheTrustPolicyKey, string](200, nil, time.Hour)
+
+// policyReadFlight collapses concurrent cache misses for the same policy key
+// into one GitHub read. The caches above are package-level, so the flight is
+// too: a per-server group would let two servers in one process race on them.
+var policyReadFlight singleflight.Group
+
+// policyReadTimeout bounds a shared read. The read outlives a caller that
+// stops waiting, but must not keep an installation token or a GitHub request
+// alive indefinitely. It is a var so tests can shorten it.
+var policyReadTimeout = 30 * time.Second
+
+// A shared read can hit policyReadTimeout after minting its short-lived token.
+// Give revocation its own small budget instead of using the expired read context.
+const policyReadRevokeTimeout = 2 * time.Second
+
+// forbiddenPolicyTTL is deliberately short so a permission fix (an installation
+// regaining contents:read, an IP allowlist edit) is picked up within a minute.
+const forbiddenPolicyTTL = time.Minute
+
+// forbiddenPolicies caches trust policy reads that returned a permission 403 so a
+// persistently misconfigured org stops re-probing GitHub (mint, read, revoke) on
+// every exchange. It is kept separate from the trustPolicies 404 negative cache
+// because a 403 must surface as PermissionDenied, not NotFound, and expires
+// faster than the 5-minute policy cache so a fixed permission recovers quickly.
+var forbiddenPolicies = expirablelru.NewLRU[cacheTrustPolicyKey, struct{}](200, nil, forbiddenPolicyTTL)
+
+// Pin confirmation caches share one size and TTL. The TTL is deliberately
+// shorter than ghinstall's 5-minute negative-cache TTL so that
+// install-then-retry recovers within a minute. Unchanged observations reuse
+// confirmations until expiry; newly observed installations trigger a refresh.
+const (
+	pinCacheSize  = 256
+	pinConfirmTTL = time.Minute
+)
+
+// pinMisses throttles repeated GetAllFresh confirmations of app-pin misses,
+// which bypass the negative install cache and hit GitHub's API.
+var pinMisses = expirablelru.NewLRU[string, struct{}](pinCacheSize, nil, pinConfirmTTL)
+
+// pinConfirmTimeout bounds a shared pin-miss confirmation walk once its
+// leader detaches from the triggering request's cancellation.
+const pinConfirmTimeout = 30 * time.Second
+
+// AppSet is the configured GitHub App directory used to resolve trust policy
+// app pins. Names maps app_name to app ID for named apps; IDs holds every
+// configured app ID (named or not) that a numeric pin may select.
+type AppSet struct {
+	Names map[string]int64
+	IDs   map[int64]bool
+}
 
 type sts struct {
 	pboidc.UnimplementedSecurityTokenServiceServer
 
-	// im is the consistent-hash manager used when the trust policy requires
-	// checks:write. Consistent hashing ensures the same GitHub App always
-	// handles a given (scope, identity), which is required because GitHub
-	// check runs can only be updated by the app that created them.
-	im ghinstall.Manager
-	// rrm is the round-robin manager used for all trust policy reads and for
-	// token exchanges when the trust policy does NOT require checks:write.
-	rrm ghinstall.Manager
-	// appCount is the number of underlying GitHub App managers. Used to cap
-	// rate-limit retries so that each app is tried at most once.
-	appCount int
-	ceclient cloudevents.Client
-	domain   string
-	metrics  bool
+	router        *ghinstall.OrgRouter
+	sticky        stickystore.Store
+	apps          AppSet
+	ceclient      cloudevents.Client
+	domain        string
+	metrics       bool
+	baseURL       string
+	orgPolicyRepo string
+	// policyDir is the directory, relative to the repository root, holding
+	// trust policies and the org trusted-issuer allowlist. Empty means
+	// DefaultPolicyDir.
+	policyDir string
+
+	// allowedIssuers, when non-empty, confines OIDC discovery to these
+	// issuers. Empty means any issuer the trust policies allow.
+	allowedIssuers []string
+
+	// orgIssuerFlight collapses concurrent org-allowlist lookups for the same
+	// owner into one enumeration. Its zero value is ready to use.
+	orgIssuerFlight singleflight.Group
+
+	// pinFreshFlight collapses concurrent pin-miss confirmation walks for the
+	// same owner into one GetAllFresh. Its zero value is ready to use.
+	pinFreshFlight singleflight.Group
+
+	// pinCandidates caches confirmed candidate sets within this
+	// service, so their transports cannot cross service configurations. It is
+	// initialized lazily for callers that need a fresh confirmation.
+	pinCandidatesOnce sync.Once
+	pinCandidates     *expirablelru.LRU[string, pinCandidateSnapshot]
+}
+
+// issuerAllowed reports whether issuer may be used for OIDC discovery. An
+// empty allowlist permits any issuer, preserving the behaviour of deployments
+// that have not set one.
+//
+// Matching is exact, as it is for the org-level issuers list.
+func (s *sts) issuerAllowed(issuer string) bool {
+	return len(s.allowedIssuers) == 0 || slices.Contains(s.allowedIssuers, issuer)
+}
+
+// pinFallbacks rotates non-checks:write pattern picks while quota data is
+// incomplete, mirroring roundRobin's cold-start counter. One counter per
+// (owner, eligible set) so unrelated pins cannot phase-lock each other;
+// bounded like the other pin caches — eviction merely restarts a rotation.
+var pinFallbacks, _ = lru.New[string, *atomic.Uint64](pinCacheSize)
+
+func (s *sts) policyRepo() string {
+	if s.orgPolicyRepo != "" {
+		return s.orgPolicyRepo
+	}
+	return ".github"
+}
+
+func (s *sts) policyDirectory() string {
+	if s.policyDir != "" {
+		return s.policyDir
+	}
+	return DefaultPolicyDir
+}
+
+// managerFor returns the installation manager for owner's app pool. The
+// error, when non-nil, is a terminal gRPC status (NotFound for an org with
+// no configured apps).
+func (s *sts) managerFor(owner string) (ghinstall.Manager, error) {
+	pool, err := s.router.GetPool(owner)
+	if err != nil {
+		return nil, err
+	}
+	return pool.M, nil
 }
 
 type cacheTrustPolicyKey struct {
@@ -99,18 +230,19 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 	}
 
 	e := Event{
-		Scope:    requestScope,
-		Identity: request.GetIdentity(),
-		Time:     time.Now(),
+		Scope:     requestScope,
+		Identity:  request.GetIdentity(),
+		Time:      time.Now(),
+		UserAgent: extractUserAgent(ctx),
 	}
 
-	if s.metrics {
+	if s.metrics && s.ceclient != nil {
 		defer func() {
 			event := cloudevents.NewEvent()
 			event.SetType("dev.octo-sts.exchange")
 			event.SetSubject(fmt.Sprintf("%s/%s", requestScope, request.GetIdentity()))
 			event.SetSource(fmt.Sprintf("https://%s", s.domain))
-			if err != nil {
+			if err != nil && e.Error == "" {
 				e.Error = err.Error()
 			}
 			if err := event.SetData(cloudevents.ApplicationJSON, e); err != nil {
@@ -147,6 +279,14 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 		return nil, status.Error(codes.InvalidArgument, "invalid issuer format")
 	}
 
+	// Confine discovery to issuers the operator named, if any. The bearer
+	// token is still unverified here and names its own issuer, so without
+	// this the caller chooses the host the next line connects to.
+	if !s.issuerAllowed(issuer) {
+		clog.FromContext(ctx).Warnf("issuer not permitted by OCTOSTS_ALLOWED_ISSUERS: %q", issuer)
+		return nil, status.Error(codes.InvalidArgument, "issuer is not allowed")
+	}
+
 	// Fetch the provider from the cache or create a new one and add to the cache
 	p, err := provider.Get(ctx, issuer)
 	if err != nil {
@@ -177,24 +317,37 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 	if request.GetIdentity() == "" {
 		return nil, status.Error(codes.InvalidArgument, "identity must be provided")
 	}
+	// The identity is interpolated into the policy path, so restrict it to a
+	// single path segment. Otherwise a value with "/" resolves to a nested file
+	// the webhook glob never validates, and ".."/"." could traverse the repo.
+	if !oidcvalidate.IsValidIdentity(request.GetIdentity()) {
+		return nil, status.Error(codes.InvalidArgument, "identity must be a single path segment")
+	}
+
+	// Check the token against the federation rules. The trust policy may live
+	// in a private repo, so the detailed reason (which names the policy's
+	// patterns) goes to the log and the event, never to the caller.
+	authorize := func(tp *OrgTrustPolicy) error {
+		clog.FromContext(ctx).Infof("trust policy: %#v", tp)
+		var cerr error
+		e.Actor, cerr = tp.CheckToken(tok, s.domain)
+		if cerr != nil {
+			clog.FromContext(ctx).Warnf("token does not match trust policy: %v", cerr)
+			e.Error = cerr.Error()
+			return status.Error(codes.PermissionDenied, "token does not match trust policy")
+		}
+		return nil
+	}
 
 	var base *ghinstallation.AppsTransport
-	base, e.InstallationID, e.TrustPolicy, err = s.lookupInstallAndTrustPolicy(ctx, requestScope, request.GetIdentity())
+	base, e.InstallationID, e.TrustPolicy, e.IssuerAllowlist, err = s.lookupInstallAndTrustPolicy(ctx, requestScope, request.GetIdentity(), tok.Subject, issuer, authorize)
 	if err != nil {
-		return nil, err
-	}
-	clog.FromContext(ctx).Infof("trust policy: %#v", e.TrustPolicy)
-
-	// Check the token against the federation rules.
-	e.Actor, err = e.TrustPolicy.CheckToken(tok, s.domain)
-	if err != nil {
-		clog.FromContext(ctx).Warnf("token does not match trust policy: %v", err)
 		return nil, err
 	}
 
 	// Synthesize a token for the requested scope and permissions based on the
 	// trust policy.
-	atr := ghinstallation.NewFromAppsTransport(base, e.InstallationID)
+	atr := ghtransport.ForInstallation(base, e.InstallationID)
 	atr.InstallationTokenOptions = &github.InstallationTokenOptions{
 		Repositories: e.TrustPolicy.Repositories,
 		Permissions:  &e.TrustPolicy.Permissions,
@@ -240,103 +393,477 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 	}, nil
 }
 
-// managerFor returns the appropriate Manager for the given trust policy key.
-//
-// If the trust policy is already cached and does NOT require checks:write,
-// round-robin is used to distribute load across apps. Otherwise consistent
-// hashing is used, which guarantees that the same (scope, identity) always
-// routes to the same GitHub App — a requirement for updating check runs.
-//
-// On a cache miss we cannot know the required permissions yet, so we default
-// to consistent hashing (the safe choice: it is always correct for
-// checks:write policies and merely suboptimal for others on the first call).
-func (s *sts) managerFor(key cacheTrustPolicyKey) ghinstall.Manager {
-	raw, ok := trustPolicies.Get(key)
-	if !ok {
-		return s.im
-	}
-	var tp OrgTrustPolicy
-	if err := yaml.UnmarshalStrict([]byte(raw), &tp); err != nil {
-		return s.im
-	}
-	if hasChecksWrite(tp.Permissions) {
-		return s.im
-	}
-	return s.rrm
-}
-
 // hasChecksWrite reports whether the given permissions include checks:write.
 func hasChecksWrite(perms github.InstallationPermissions) bool {
 	return perms.Checks != nil && *perms.Checks == "write"
 }
 
-func (s *sts) lookupInstallAndTrustPolicy(ctx context.Context, scope, identity string) (*ghinstallation.AppsTransport, int64, *OrgTrustPolicy, error) {
+// getExchangeInstall picks the installation for the token exchange, in
+// precedence order: the policy's app pin, the persisted sticky installation
+// for checks:write policies, then the installation that read the policy.
+func (s *sts) getExchangeInstall(ctx context.Context, pool *ghinstall.OrgPool, owner, scope, identity, subject string, tp *TrustPolicy, readAtr *ghinstallation.AppsTransport, readID int64) (*ghinstallation.AppsTransport, int64, error) {
+	eligible, err := s.eligibleApps(pool, owner, tp)
+	if err != nil {
+		return nil, 0, err
+	}
+	checksWrite := hasChecksWrite(tp.Permissions)
+	if eligible != nil {
+		return s.getPinnedInstall(ctx, pool, owner, scope, identity, subject, checksWrite, eligible)
+	}
+
+	if s.sticky == nil || !checksWrite {
+		return readAtr, readID, nil
+	}
+
+	key := routekey.Key(scope, identity, subject)
+	if cachedID, ok, err := s.sticky.Get(ctx, key); err == nil && ok {
+		atr, id, err := pool.M.GetByInstallation(ctx, owner, cachedID)
+		if err == nil {
+			return atr, id, nil
+		}
+		clog.FromContext(ctx).Infof("sticky install %d no longer valid for %s, reassigning", cachedID, owner)
+	}
+
+	atr, id, err := pool.M.Get(ctx, owner, scope, identity)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	s.putSticky(ctx, key, id, scope, identity, subject)
+	return atr, id, nil
+}
+
+// putSticky persists a sticky mapping, warning instead of failing on error.
+func (s *sts) putSticky(ctx context.Context, key string, id int64, scope, identity, subject string) {
+	if err := s.sticky.Put(ctx, key, id, scope, identity, subject); err != nil {
+		clog.FromContext(ctx).Warnf("stickystore: Put failed for key %s: %v", key, err)
+	}
+}
+
+// eligibleApps resolves the policy's app pin to configured app IDs in the
+// selected owner's pool. Configured membership includes apps whose lookup
+// currently fails, so incomplete installation results cannot narrow the pin.
+// Returns nil when the policy does not restrict apps.
+func (s *sts) eligibleApps(pool *ghinstall.OrgPool, owner string, tp *TrustPolicy) (map[int64]bool, error) {
+	switch {
+	case tp.App != "":
+		id, configured := s.apps.Names[tp.App]
+		if !configured {
+			var err error
+			id, err = strconv.ParseInt(tp.App, 10, 64)
+			configured = err == nil && s.apps.IDs[id]
+		}
+		if !configured {
+			return nil, status.Errorf(codes.FailedPrecondition, "trust policy app %q is not a configured app", tp.App)
+		}
+		if !pool.AppIDs[id] {
+			return nil, status.Errorf(codes.FailedPrecondition, "trust policy app %q is not configured for %q", tp.App, owner)
+		}
+		return map[int64]bool{id: true}, nil
+	case tp.appPattern != nil:
+		eligible := make(map[int64]bool)
+		for name, id := range s.apps.Names {
+			if pool.AppIDs[id] && tp.appPattern.MatchString(name) {
+				eligible[id] = true
+			}
+		}
+		if len(eligible) == 0 {
+			return nil, status.Errorf(codes.FailedPrecondition, "trust policy app_pattern %q matches no configured apps for %q", tp.AppPattern, owner)
+		}
+		return eligible, nil
+	}
+	return nil, nil
+}
+
+// getPinnedInstall picks among owner's installations of the eligible apps.
+// eligible must already be scoped to the selected pool by eligibleApps.
+// checks:write policies pick deterministically by route key so check-run
+// ownership stays stable with or without a sticky store (and stick within
+// the eligible set when one is configured); other policies use capacity-aware
+// selection. Absence conclusions (no candidates, cached sticky install
+// missing) are confirmed with GetAllFresh — GetAll's negative cache can hide
+// a newly installed app behind a nil error — and confirmed absences are
+// cached to throttle the fresh walks.
+func (s *sts) getPinnedInstall(ctx context.Context, pool *ghinstall.OrgPool, owner, scope, identity, subject string, checksWrite bool, eligible map[int64]bool) (*ghinstallation.AppsTransport, int64, error) {
+	insts, enumErr := pool.M.GetAll(ctx, owner)
+	candidates := eligibleInstalls(insts, eligible)
+	fresh := false
+	if len(candidates) == 0 {
+		if enumErr != nil {
+			return nil, 0, enumErr
+		}
+		missKey := pinMissKey(owner, eligible)
+		if _, confirmed := pinMisses.Get(missKey); confirmed {
+			return nil, 0, pinMissErr(owner, eligible, nil)
+		}
+		recordMiss := func(insts []ghinstall.Installation, err error) {
+			if err == nil && len(eligibleInstalls(insts, eligible)) == 0 {
+				pinMisses.Add(missKey, struct{}{})
+			}
+		}
+		insts, enumErr = s.getAllFreshShared(ctx, pool, owner, recordMiss)
+		candidates = eligibleInstalls(insts, eligible)
+		fresh = true
+		if len(candidates) == 0 {
+			if enumErr != nil {
+				return nil, 0, enumErr
+			}
+			return nil, 0, pinMissErr(owner, eligible, nil)
+		}
+	}
+
+	key := routekey.Key(scope, identity, subject)
+	sticky := s.sticky != nil && checksWrite
+	if sticky {
+		if cachedID, ok, err := s.sticky.Get(ctx, key); err == nil && ok {
+			inst, present, eligibleOK := locate(insts, eligible, cachedID)
+			if eligibleOK {
+				return inst.Transport, inst.ID, nil
+			}
+			// Present but ineligible is proof; absence needs confirmation,
+			// since an incomplete enumeration cannot prove the install is
+			// gone.
+			if !present {
+				if enumErr != nil {
+					return nil, 0, enumErr
+				}
+				absKey := stickyAbsenceKey(owner, cachedID)
+				_, confirmed := pinMisses.Get(absKey)
+				if !confirmed && !fresh {
+					recordAbsent := func(freshInsts []ghinstall.Installation, err error) {
+						if err != nil {
+							return
+						}
+						if _, p, _ := locate(freshInsts, eligible, cachedID); !p {
+							pinMisses.Add(absKey, struct{}{})
+						}
+					}
+					freshInsts, freshErr := s.getAllFreshShared(ctx, pool, owner, recordAbsent)
+					inst, present, eligibleOK = locate(freshInsts, eligible, cachedID)
+					if eligibleOK {
+						return inst.Transport, inst.ID, nil
+					}
+					if !present && freshErr != nil {
+						return nil, 0, freshErr
+					}
+					// Use the fresh result, including an empty set, so an
+					// older snapshot cannot override this confirmation.
+					candidates, enumErr = eligibleInstalls(freshInsts, eligible), freshErr
+					fresh = true
+				}
+				if !present && !confirmed {
+					pinMisses.Add(absKey, struct{}{})
+				}
+			}
+			clog.FromContext(ctx).Infof("sticky install %d not in pinned app set for %s", cachedID, owner)
+		}
+	}
+
+	if checksWrite && (fresh || len(candidates) < len(eligible)) {
+		var err error
+		if candidates, err = s.confirmStableCandidates(ctx, pool, owner, eligible, candidates, fresh, enumErr); err != nil {
+			return nil, 0, err
+		}
+		if len(candidates) == 0 {
+			return nil, 0, pinMissErr(owner, eligible, nil)
+		}
+	}
+
+	var pick ghinstall.Installation
+	if checksWrite {
+		// Configuration order must not change check-run ownership. candidates
+		// is a private slice, so sorting cannot mutate a manager or cache entry.
+		//
+		// An uninstalled app's positive-cache entry has no TTL, so it stays in
+		// candidates until process restart; a hash landing on it fails closed
+		// at mint. Rotation and quota picks move off a dead install on their
+		// own — this deterministic pick is the one that cannot.
+		slices.SortFunc(candidates, func(a, b ghinstall.Installation) int {
+			if order := cmp.Compare(a.AppID, b.AppID); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.ID, b.ID)
+		})
+		pick = candidates[routekey.Index(scope, identity, subject, len(candidates))]
+	} else if qp, ok := ghinstall.PickByQuota(ctx, candidates, pool.Quota); ok {
+		pick = qp
+	} else {
+		k := pinMissKey(owner, eligible)
+		ctr, ok := pinFallbacks.Get(k)
+		if !ok {
+			ctr = new(atomic.Uint64)
+			pinFallbacks.Add(k, ctr)
+		}
+		pick = candidates[ctr.Add(1)%uint64(len(candidates))]
+	}
+	if sticky {
+		s.putSticky(ctx, key, pick.ID, scope, identity, subject)
+	}
+	return pick.Transport, pick.ID, nil
+}
+
+// pinCandidateSnapshot keeps the authoritative candidates separate from the
+// installation identities observed before and during confirmation. Remembering
+// both observations lets new installations trigger a refresh without repeatedly
+// confirming an unchanged stale list that the fresh walk already corrected.
+type pinCandidateSnapshot struct {
+	candidates []ghinstall.Installation
+	observed   map[int64]int64 // installation ID -> App ID
+}
+
+func newPinCandidateSnapshot(candidates, observed []ghinstall.Installation) pinCandidateSnapshot {
+	snapshot := pinCandidateSnapshot{
+		candidates: slices.Clone(candidates),
+		observed:   make(map[int64]int64, len(candidates)+len(observed)),
+	}
+	for _, inst := range observed {
+		snapshot.observed[inst.ID] = inst.AppID
+	}
+	for _, inst := range candidates {
+		snapshot.observed[inst.ID] = inst.AppID
+	}
+	return snapshot
+}
+
+// confirmStableCandidates enforces set stability for checks:write picks:
+// hashing a subset flips ownership when it heals, and replicas holding
+// divergent partial views would persist different assignments. An enumeration
+// error with missing eligible apps fails closed; error-free incompleteness
+// can be a negative-cache omission, so it is confirmed fresh before hashing.
+// Cached confirmations are reused until expiry or a new installation is
+// observed. Retaining confirmed candidates also prevents a delayed caller's
+// older enumeration from overriding a completed confirmation.
+func (s *sts) confirmStableCandidates(ctx context.Context, pool *ghinstall.OrgPool, owner string, eligible map[int64]bool, candidates []ghinstall.Installation, fresh bool, enumErr error) ([]ghinstall.Installation, error) {
+	if enumErr != nil && len(candidates) < len(eligible) {
+		return nil, enumErr
+	}
+	s.pinCandidatesOnce.Do(func() {
+		s.pinCandidates = expirablelru.NewLRU[string, pinCandidateSnapshot](pinCacheSize, nil, pinConfirmTTL)
+	})
+	incKey := pinMissKey(owner, eligible)
+	if fresh {
+		s.pinCandidates.Add(incKey, newPinCandidateSnapshot(candidates, nil))
+		return candidates, nil
+	}
+	if cached, ok := s.pinCandidates.Get(incKey); ok {
+		known := true
+		for _, inst := range candidates {
+			if appID, ok := cached.observed[inst.ID]; !ok || appID != inst.AppID {
+				known = false
+				break
+			}
+		}
+		if known {
+			return slices.Clone(cached.candidates), nil
+		}
+	}
+	observed := candidates
+	recordCandidates := func(insts []ghinstall.Installation, err error) {
+		freshEligible := eligibleInstalls(insts, eligible)
+		if err == nil || len(freshEligible) == len(eligible) {
+			s.pinCandidates.Add(incKey, newPinCandidateSnapshot(freshEligible, observed))
+		}
+	}
+	freshInsts, freshErr := s.getAllFreshShared(ctx, pool, owner, recordCandidates)
+	candidates = eligibleInstalls(freshInsts, eligible)
+	if freshErr != nil && len(candidates) < len(eligible) {
+		return nil, freshErr
+	}
+	return candidates, nil
+}
+
+// getAllFreshShared collapses concurrent GetAllFresh confirmation walks for
+// the same owner into one. The leader detaches from its caller's cancellation
+// so waiters sharing the walk are not failed by an unrelated cancel, and its
+// own pinConfirmTimeout expiring surfaces as Unavailable rather than
+// DeadlineExceeded because no caller's deadline fired; the result pairs
+// installations with the enumeration error, preserving partial-enumeration
+// semantics. A shared walk may have started before a
+// waiter's own cache observation, so a confirmation can lag reality by up to
+// the walk's duration. record, when non-nil, receives the flight's result on
+// every path — normal completion and caller cancellation — so recording
+// logic lives in one place and a completed walk is never discarded.
+func (s *sts) getAllFreshShared(ctx context.Context, pool *ghinstall.OrgPool, owner string, record func([]ghinstall.Installation, error)) ([]ghinstall.Installation, error) {
+	ch := s.pinFreshFlight.DoChan(owner, func() (any, error) {
+		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinConfirmTimeout)
+		defer cancel()
+		insts, err := pool.M.GetAllFresh(workCtx, owner)
+		if status.Code(err) == codes.DeadlineExceeded {
+			err = status.Errorf(codes.Unavailable, "confirming installations for %q: %v", owner, err)
+		}
+		return insts, err
+	})
+	select {
+	case <-ctx.Done():
+		if record != nil {
+			go func() {
+				res := <-ch
+				insts, _ := res.Val.([]ghinstall.Installation)
+				record(insts, res.Err)
+			}()
+		}
+		return nil, status.FromContextError(ctx.Err()).Err()
+	case res := <-ch:
+		insts, _ := res.Val.([]ghinstall.Installation)
+		if record != nil {
+			record(insts, res.Err)
+		}
+		return insts, res.Err
+	}
+}
+
+// eligibleInstalls filters insts to installations of the eligible apps.
+func eligibleInstalls(insts []ghinstall.Installation, eligible map[int64]bool) []ghinstall.Installation {
+	out := make([]ghinstall.Installation, 0, len(insts))
+	for _, inst := range insts {
+		if eligible[inst.AppID] {
+			out = append(out, inst)
+		}
+	}
+	return out
+}
+
+// pinMissErr names the eligible apps that have no installation for owner.
+func pinMissErr(owner string, eligible map[int64]bool, candidates []ghinstall.Installation) error {
+	present := make(map[int64]bool, len(candidates))
+	for _, c := range candidates {
+		present[c.AppID] = true
+	}
+	missing := make([]int64, 0, len(eligible))
+	for id := range eligible {
+		if !present[id] {
+			missing = append(missing, id)
+		}
+	}
+	slices.Sort(missing)
+	return status.Errorf(codes.FailedPrecondition, "no installation for %q matches the trust policy app pin (missing apps %v)", owner, missing)
+}
+
+// stickyAbsenceKey identifies a confirmed-absent installation for owner.
+func stickyAbsenceKey(owner string, installID int64) string {
+	return fmt.Sprintf("%s|inst|%d", owner, installID)
+}
+
+// pinMissKey identifies a confirmed (owner, eligible apps) pin miss.
+func pinMissKey(owner string, eligible map[int64]bool) string {
+	return fmt.Sprintf("%s|%v", owner, slices.Sorted(maps.Keys(eligible)))
+}
+
+// locate finds the installation with the given ID in insts, reporting
+// whether it is present and whether its app is eligible.
+func locate(insts []ghinstall.Installation, eligible map[int64]bool, id int64) (inst ghinstall.Installation, present, ok bool) {
+	for _, c := range insts {
+		if c.ID == id {
+			return c, true, eligible[c.AppID]
+		}
+	}
+	return ghinstall.Installation{}, false, false
+}
+
+// lookupInstallAndTrustPolicy resolves the installation, enforces the
+// organization trusted-issuer allowlist, loads the trust policy, and calls
+// authorize on it before picking the exchange installation.
+//
+// The caller is unauthorized until authorize passes, so the app pin is only
+// resolved (and its errors surfaced) after it. If authorize fails, the policy
+// and the installation that read it are still returned for the audit event.
+//
+// issuer must be the value apiauth.ExtractIssuer returned — the same one
+// provider.Get was given — because allowlist entries are always written with a
+// scheme, and ExtractIssuer applies auth.NormalizeIssuer. In practice the two
+// forms coincide for every token that reaches here: the only value
+// NormalizeIssuer rewrites is the schemeless "accounts.google.com", and
+// TrustPolicy.CheckToken rejects that outright because
+// oidcvalidate.IsValidIssuer returns false for it. Passing the normalized value
+// is the conservative choice should either of those change.
+func (s *sts) lookupInstallAndTrustPolicy(ctx context.Context, scope, identity, subject, issuer string, authorize func(*OrgTrustPolicy) error) (*ghinstallation.AppsTransport, int64, *OrgTrustPolicy, *IssuerDecision, error) {
 	otp := &OrgTrustPolicy{}
 	var tp trustPolicy = &otp.TrustPolicy
 
 	owner, repo := path.Dir(scope), path.Base(scope)
 	if owner == "." {
-		owner, repo = repo, ".github"
+		owner, repo = repo, s.policyRepo()
 	} else {
 		otp.Repositories = []string{repo}
 	}
 
-	// If the repo is .github, then parse with an org policy even if the repo
-	// was specified as .github because we will reject the repositories field
-	// in policies otherwise.
-	if repo == ".github" {
+	// If the repo is the org policy repo, then parse with an org policy even
+	// if the repo was specified explicitly because we will reject the
+	// repositories field in policies otherwise.
+	if repo == s.policyRepo() {
 		tp = otp
 	}
 
-	trustPolicyKey := cacheTrustPolicyKey{
-		owner:    owner,
-		repo:     repo,
-		identity: identity,
-	}
-
-	// Choose exchange routing strategy. managerFor peeks the trust policy
-	// cache so that, after the first call, policies without checks:write use
-	// round-robin instead of consistent hashing for the exchange.
-	im := s.managerFor(trustPolicyKey)
-	atr, id, err := im.Get(ctx, owner, scope, identity)
+	// Look up the org's app pool.
+	pool, err := s.router.GetPool(owner)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, nil, err
 	}
 
-	// Policy reads always use round-robin to spread GitHub API calls across
-	// apps. Any installed app can read the policy file — there is no
-	// state dependency between which app reads the policy and which app
-	// performs the exchange. The exchange transport (atr, id) is returned
-	// to the caller unchanged.
-	readAtr, readId := atr, id
-	if rAtr, rId, rErr := s.rrm.Get(ctx, owner, scope, identity); rErr == nil {
-		readAtr, readId = rAtr, rId
+	tpKey := cacheTrustPolicyKey{owner: owner, repo: repo, identity: identity}
+
+	if cached, ok := trustPolicies.Get(tpKey); ok && cached == negativeCacheConst {
+		clog.InfoContextf(ctx, "negative cache hit for %s", tpKey)
+		return nil, 0, nil, nil, status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity)
 	}
 
-	err = s.lookupTrustPolicy(ctx, readAtr, readId, trustPolicyKey, tp)
+	// Read the trust policy using any available installation in this org's pool.
+	readAtr, readID, err := pool.M.Get(ctx, owner, scope, identity)
+	if err != nil {
+		return nil, 0, nil, nil, err
+	}
 
-	// If the policy read was rate-limited and there are multiple apps,
-	// retry with the remaining apps in the round-robin rotation.
-	// Cap retries at maxRetry to avoid hammering all apps on a broad outage.
-	if isRateLimit(err) && s.appCount > 1 {
-		retries := min(maxRetry, s.appCount-1)
-		for i := 0; i < retries; i++ {
-			clog.InfoContextf(ctx, "policy read rate-limited, trying next app (%d/%d)", i+1, retries)
-			rAtr, rId, rErr := s.rrm.Get(ctx, owner, scope, identity)
-			if rErr != nil {
-				continue
-			}
-			err = s.lookupTrustPolicy(ctx, rAtr, rId, trustPolicyKey, tp)
-			if !isRateLimit(err) {
-				break
-			}
+	// Enforce the organization trusted-issuer allowlist before spending a policy
+	// read or a second token mint on an issuer we may reject.
+	//
+	// This runs AFTER pool.M.Get even though it ignores its return values: Get's
+	// negative install cache rejects an owner the App is not installed on before
+	// we do any allowlist work, which bounds the API amplification an arbitrary
+	// caller-supplied scope can drive.
+	decision, err := s.checkOrgTrustedIssuers(ctx, owner, issuer)
+	if err != nil {
+		return nil, 0, nil, decision, err
+	}
+
+	readAtr, readID, err = s.lookupTrustPolicyWithRetry(ctx, pool, readAtr, readID, owner, scope, identity, tpKey, tp)
+	if err != nil {
+		return nil, 0, nil, decision, err
+	}
+
+	if err := authorize(otp); err != nil {
+		return nil, readID, otp, decision, err
+	}
+
+	// Now that the caller is authorized, pick the exchange installation.
+	atr, id, err := s.getExchangeInstall(ctx, pool, owner, scope, identity, subject, &otp.TrustPolicy, readAtr, readID)
+	if err != nil {
+		return nil, 0, nil, decision, err
+	}
+
+	return atr, id, otp, decision, nil
+}
+
+// lookupTrustPolicyWithRetry fetches the trust policy, retrying with
+// different installations from the pool if the first attempt is rate-limited.
+func (s *sts) lookupTrustPolicyWithRetry(ctx context.Context, pool *ghinstall.OrgPool, atr *ghinstallation.AppsTransport, id int64, owner, scope, identity string, tpKey cacheTrustPolicyKey, tp trustPolicy) (*ghinstallation.AppsTransport, int64, error) {
+	err := s.lookupTrustPolicy(ctx, atr, id, tpKey, tp)
+	if !isRateLimit(err) || pool.AppCount <= 1 {
+		return atr, id, err
+	}
+
+	retries := min(maxRetry, pool.AppCount-1)
+	for i := range retries {
+		clog.InfoContextf(ctx, "policy read rate-limited, trying next app (%d/%d)", i+1, retries)
+		rAtr, rId, rErr := pool.M.Get(ctx, owner, scope, identity)
+		if rErr != nil {
+			continue
+		}
+		err = s.lookupTrustPolicy(ctx, rAtr, rId, tpKey, tp)
+		if !isRateLimit(err) {
+			return rAtr, rId, err
 		}
 	}
-
-	if err != nil {
-		return atr, id, nil, err
-	}
-	return atr, id, otp, nil
+	return atr, id, err
 }
 
 // isRateLimit reports whether err is a gRPC ResourceExhausted error,
@@ -349,95 +876,352 @@ func isRateLimit(err error) bool {
 	return ok && st.Code() == codes.ResourceExhausted
 }
 
+// isProvenRateLimit reports whether err is PROVEN to be a rate limit, not
+// merely a 403. go-github types a *RateLimitError for a 403/429
+// carrying X-RateLimit-Remaining: 0, and *AbuseRateLimitError for a secondary
+// limit, but only when the response documentation_url ends with a known
+// rate-limit anchor (github.go CheckResponse). GitHub also answers a secondary
+// limit with a bare 403 that carries Retry-After but no matching anchor, which
+// go-github leaves as a plain *ErrorResponse; the header fallback below catches
+// that so it is not mistaken for a permission denial. This mirrors isMintRateLimit.
+//
+// A 403 with none of these markers is NOT counted: it is a permission failure
+// (resource not accessible by integration, IP allowlist, SAML/SSO, ToS lock),
+// and mislabeling it as a rate limit both misleads operators and burns quota
+// rotating apps that cannot help.
+func isProvenRateLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rateLimitErr *github.RateLimitError
+	var abuseRateLimitErr *github.AbuseRateLimitError
+	if errors.As(err, &rateLimitErr) || errors.As(err, &abuseRateLimitErr) {
+		return true
+	}
+	var errResp *github.ErrorResponse
+	if !errors.As(err, &errResp) || errResp.Response == nil {
+		return false
+	}
+	if errResp.Response.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	// A 403 carrying Retry-After (secondary limit) or an exhausted remaining
+	// count (primary limit) is a rate limit even when go-github's anchor match
+	// failed to type it.
+	return errResp.Response.StatusCode == http.StatusForbidden &&
+		(errResp.Response.Header.Get("Retry-After") != "" ||
+			errResp.Response.Header.Get("X-RateLimit-Remaining") == "0")
+}
+
+// isForbidden reports whether err is a GitHub 403. It must be called only after
+// isProvenRateLimit has returned false: a rate-limited 403 (Retry-After or an
+// exhausted remaining count) also has status 403, so on its own isForbidden does
+// not distinguish a permission denial from a rate limit. In fetchTrustPolicyRaw
+// the isProvenRateLimit gate runs first, so anything reaching here is a genuine
+// permission-denied response.
+func isForbidden(err error) bool {
+	var errResp *github.ErrorResponse
+	return errors.As(err, &errResp) && errResp.Response != nil &&
+		errResp.Response.StatusCode == http.StatusForbidden
+}
+
 type trustPolicy interface {
 	Compile() error
 }
 
-func (s *sts) lookupTrustPolicy(ctx context.Context, base *ghinstallation.AppsTransport, install int64, trustPolicyKey cacheTrustPolicyKey, tp trustPolicy) error {
-	// Enrich context with app/installation IDs so the httpmetrics transport
-	// can label rate limit metrics with the specific installation consuming quota.
+// lookupTrustPolicy fetches, parses, and compiles a trust policy into tp.
+// The raw YAML is served from the LRU cache when available; on a miss
+// it is read from GitHub via a short-lived contents:read token that is
+// revoked after the read.
+func (s *sts) lookupTrustPolicy(ctx context.Context, base *ghinstallation.AppsTransport, install int64, tpKey cacheTrustPolicyKey, tp trustPolicy) error {
 	ctx = ghtransport.EnrichContext(ctx, base.AppID(), install)
 
-	raw := ""
-	// check the LRU cache for the TrustPolicy
-	if cachedRawPolicy, ok := trustPolicies.Get(trustPolicyKey); ok {
-		clog.InfoContextf(ctx, "found trust policy in cache for %s", trustPolicyKey)
-		raw = cachedRawPolicy
-	}
-
-	// if is not cached will get the trustpolicy from the api
-	if raw == "" {
-		atr := ghinstallation.NewFromAppsTransport(base, install)
-		// We only need to read from the repository, so create that token to fetch
-		// the trust policy.
-		atr.InstallationTokenOptions = &github.InstallationTokenOptions{
-			Repositories: []string{trustPolicyKey.repo},
-			Permissions: &github.InstallationPermissions{
-				Contents: ptr("read"),
-			},
-		}
-		// Once we have looked up the trust policy we should revoke the token.
-		defer func() {
-			tok, err := atr.Token(ctx)
-			if err != nil {
-				clog.WarnContextf(ctx, "failed to get token for revocation: %v", err)
-				return
-			}
-			if err := Revoke(ctx, tok); err != nil {
-				clog.WarnContextf(ctx, "failed to revoke token: %v", err)
-				return
-			}
-		}()
-
-		client := github.NewClient(&http.Client{
-			Transport: atr,
-		})
-
-		file, _, _, err := client.Repositories.GetContents(ctx,
-			trustPolicyKey.owner, trustPolicyKey.repo,
-			fmt.Sprintf(".github/chainguard/%s.sts.yaml", trustPolicyKey.identity),
-			&github.RepositoryContentGetOptions{ /* defaults to the default branch */ },
-		)
-		if err != nil {
-			clog.InfoContextf(ctx, "failed to find trust policy: %v", err)
-			// Don't leak the error to the client.
-			var ghErr *github.ErrorResponse
-			if errors.As(err, &ghErr) && ghErr.Response != nil {
-				switch ghErr.Response.StatusCode {
-				case http.StatusForbidden:
-					return status.Errorf(codes.ResourceExhausted, "GitHub API rate limit exceeded (403) for %q", trustPolicyKey.identity)
-				case http.StatusTooManyRequests:
-					return status.Errorf(codes.ResourceExhausted, "GitHub API rate limit exceeded (429) for %q", trustPolicyKey.identity)
-				}
-			}
-			return status.Errorf(codes.NotFound, "unable to find trust policy for %q", trustPolicyKey.identity)
-		}
-
-		raw, err = file.GetContent()
-		if err != nil {
-			clog.ErrorContextf(ctx, "failed to read trust policy: %v", err)
-			// Don't leak the error to the client.
-			return status.Errorf(codes.NotFound, "unable to read trust policy found for %q", trustPolicyKey.identity)
-		}
-
-		if evicted := trustPolicies.Add(trustPolicyKey, raw); evicted {
-			clog.InfoContextf(ctx, "evicted cachekey %s", trustPolicyKey)
-		}
+	raw, err := s.fetchTrustPolicyRaw(ctx, base, install, tpKey)
+	if err != nil {
+		return err
 	}
 
 	if err := yaml.UnmarshalStrict([]byte(raw), tp); err != nil {
 		clog.InfoContextf(ctx, "failed to parse trust policy: %v", err)
-		// Don't leak the error to the client.
-		return status.Errorf(codes.NotFound, "unable to parse trust policy found for %q", trustPolicyKey.identity)
+		return status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity)
 	}
-
 	if err := tp.Compile(); err != nil {
 		clog.InfoContextf(ctx, "failed to compile trust policy: %v", err)
-		// Don't leak the error to the client.
-		return status.Errorf(codes.NotFound, "unable to compile trust policy found for %q", trustPolicyKey.identity)
+		return status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity)
+	}
+	return nil
+}
+
+// fetchTrustPolicyRaw returns the raw YAML for a trust policy, serving
+// from the LRU cache when possible and falling back to the GitHub API.
+func (s *sts) fetchTrustPolicyRaw(ctx context.Context, base *ghinstallation.AppsTransport, install int64, tpKey cacheTrustPolicyKey) (string, error) {
+	if raw, found, err := cachedTrustPolicyRaw(ctx, tpKey); found {
+		return raw, err
+	}
+	return s.fetchTrustPolicyRawAfterCacheMiss(ctx, base, install, tpKey)
+}
+
+// cachedTrustPolicyRaw checks the three caches that can terminate a policy
+// read: a cached policy, a cached 404, and the 403 cooldown. The same check
+// runs inside the flight: a caller can miss here and be descheduled until
+// after an earlier flight has filled a cache entry.
+func cachedTrustPolicyRaw(ctx context.Context, tpKey cacheTrustPolicyKey) (string, bool, error) {
+	if cached, ok := trustPolicies.Get(tpKey); ok {
+		if cached == negativeCacheConst {
+			clog.InfoContextf(ctx, "negative cache hit for %s", tpKey)
+			return "", true, status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity)
+		}
+		clog.InfoContextf(ctx, "found trust policy in cache for %s", tpKey)
+		return cached, true, nil
 	}
 
-	return nil
+	// A recent permission 403 short-circuits the mint/read/revoke cycle for the
+	// cooldown window, so a misconfigured org stops re-probing GitHub on every
+	// exchange. Distinct from the 404 negative cache: this returns
+	// PermissionDenied and expires faster (see forbiddenPolicyTTL).
+	if _, ok := forbiddenPolicies.Get(tpKey); ok {
+		clog.InfoContextf(ctx, "forbidden cooldown hit for %s", tpKey)
+		return "", true, status.Errorf(codes.PermissionDenied, "trust policy read forbidden for %q (not a rate limit)", tpKey.identity)
+	}
+	return "", false, nil
+}
+
+// policyReadResult is a flight's outcome together with the installation that
+// produced it, so a waiter can tell an inherited rate limit from its own.
+type policyReadResult struct {
+	raw     string
+	install int64
+}
+
+// fetchTrustPolicyRawAfterCacheMiss joins the flight for tpKey. Only the
+// leader reads GitHub and writes to the shared caches; each waiter can still
+// leave when its own request context is canceled. The flight is keyed exactly
+// like the caches, so no two concurrent readers can write the same entry.
+//
+// A rate limit belongs to the installation that hit it. A waiter that picked
+// a different installation does not report it as its own, because
+// lookupTrustPolicyWithRetry would count it against the waiter's rotation
+// budget and could exhaust it without ever reading the waiter's healthy
+// installation. The waiter re-reads on its own installation instead, a
+// bounded number of times so a stream of flights led from a limited
+// installation cannot hold it indefinitely.
+func (s *sts) fetchTrustPolicyRawAfterCacheMiss(ctx context.Context, base *ghinstallation.AppsTransport, install int64, tpKey cacheTrustPolicyKey) (string, error) {
+	key := fmt.Sprintf("%q/%q/%q", tpKey.owner, tpKey.repo, tpKey.identity)
+	for rejoins := 0; ; rejoins++ {
+		ch := policyReadFlight.DoChan(key, func() (any, error) {
+			raw, err := s.leadPolicyRead(ctx, base, install, tpKey)
+			return policyReadResult{raw: raw, install: install}, err
+		})
+		select {
+		case <-ctx.Done():
+			return "", status.FromContextError(ctx.Err()).Err()
+		case res := <-ch:
+			if res.Err == nil {
+				return res.Val.(policyReadResult).raw, nil
+			}
+			leader, ok := res.Val.(policyReadResult)
+			if ok && isRateLimit(res.Err) && leader.install != install && rejoins < maxInheritedRateLimitRejoins {
+				clog.InfoContextf(ctx, "policy read for %q inherited a rate limit from installation %d, re-reading with installation %d", tpKey.identity, leader.install, install)
+				continue
+			}
+			return "", res.Err
+		}
+	}
+}
+
+// leadPolicyRead is the body of a policy-read flight: it re-checks the
+// caches, then reads GitHub on the flight's own deadline.
+func (s *sts) leadPolicyRead(ctx context.Context, base *ghinstallation.AppsTransport, install int64, tpKey cacheTrustPolicyKey) (string, error) {
+	if raw, found, err := cachedTrustPolicyRaw(ctx, tpKey); found {
+		return raw, err
+	}
+	// WithoutCancel keeps the leader's request values (logger, app and
+	// installation) but detaches its cancellation, so the only deadline
+	// the read can see is policyReadTimeout.
+	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), policyReadTimeout)
+	defer cancel()
+	raw, err := s.fetchTrustPolicyRawUncached(workCtx, base, install, tpKey)
+	if status.Code(err) == codes.DeadlineExceeded {
+		// The shared read hit policyReadTimeout. No waiter gave up, so
+		// report a transient GitHub failure the caller may retry, not a
+		// deadline the caller never set. Nothing is cached.
+		clog.WarnContextf(ctx, "trust policy read for %q timed out after %v", tpKey.identity, policyReadTimeout)
+		return "", status.Errorf(codes.Unavailable, "trust policy read for %q timed out", tpKey.identity)
+	}
+	return raw, err
+}
+
+// fetchTrustPolicyRawUncached mints a contents:read token, reads the policy
+// from GitHub, and fills the caches. It runs only as a flight leader on the
+// flight's own context, so a context error here is policyReadTimeout, never a
+// waiter giving up.
+func (s *sts) fetchTrustPolicyRawUncached(ctx context.Context, base *ghinstallation.AppsTransport, install int64, tpKey cacheTrustPolicyKey) (string, error) {
+	atr := ghtransport.ForInstallation(base, install)
+	atr.InstallationTokenOptions = &github.InstallationTokenOptions{
+		Repositories: []string{tpKey.repo},
+		Permissions: &github.InstallationPermissions{
+			Contents: new("read"),
+		},
+	}
+	var mintedToken string
+	defer func() {
+		// No token was minted if client creation or token acquisition failed.
+		// In particular, do not mint a new token solely to revoke it.
+		if mintedToken == "" {
+			return
+		}
+		revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), policyReadRevokeTimeout)
+		defer cancel()
+		if err := Revoke(revokeCtx, mintedToken, s.baseURL); err != nil {
+			clog.WarnContextf(ctx, "failed to revoke token: %v", err)
+		}
+	}()
+
+	client, err := newGitHubClient(atr, s.baseURL)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "creating GitHub client: %v", err)
+	}
+	// GetContents can fail transiently (a 5xx, a network blip, or a token-mint
+	// error). Those must not be reported as NotFound, which masks the real cause
+	// and offers no retry. Retry the transient class same-app with a short
+	// backoff, sitting below the fleet rotation in lookupTrustPolicyWithRetry,
+	// and surface an unresolved transient failure as Unavailable. Three classes
+	// stop immediately instead: a proven rate limit (the rotation layer handles
+	// it), a permission-denied 403 (no app can resolve it), and a 404 (the
+	// genuine "no policy" answer that seeds the negative cache).
+	op := func() (string, error) {
+		// GetContents would mint through this same transport. Acquire explicitly
+		// so revocation knows which token to use even if the read times out.
+		tok, err := atr.Token(ctx)
+		var file *github.RepositoryContent
+		if err == nil {
+			mintedToken = tok
+			file, _, _, err = client.Repositories.GetContents(ctx,
+				tpKey.owner, tpKey.repo,
+				path.Join(s.policyDirectory(), tpKey.identity+".sts.yaml"),
+				&github.RepositoryContentGetOptions{},
+			)
+		}
+		if err == nil {
+			if file == nil {
+				// GetContents returns a nil file when the path is a directory;
+				// GetContent would panic on it. Treat it as no policy.
+				clog.InfoContextf(ctx, "trust policy path is not a file for %s", tpKey)
+				return "", backoff.Permanent(status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity))
+			}
+			raw, rerr := file.GetContent()
+			if rerr != nil {
+				clog.ErrorContextf(ctx, "failed to read trust policy: %v", rerr)
+				return "", backoff.Permanent(status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity))
+			}
+			// Populate the caches on the fresh-fetch path only. The stale-serve
+			// branch below must not reach here, or it would renew the stale
+			// entry's TTL on every rate-limited exchange and keep a stale policy
+			// servable indefinitely.
+			if evicted := trustPolicies.Add(tpKey, raw); evicted {
+				clog.InfoContextf(ctx, "evicted cachekey %s", tpKey)
+			}
+			staleTrustPolicies.Add(tpKey, raw)
+			return raw, nil
+		}
+		clog.InfoContextf(ctx, "failed to find trust policy: %v", err)
+
+		// The read's own deadline passed; propagate rather than retry or mask.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", backoff.Permanent(status.FromContextError(err).Err())
+		}
+		// Rate limits FIRST, and only PROVEN ones: a typed rate-limit error or a
+		// 429. A bare 403 is handled below as permission-denied, not here, so it
+		// no longer masquerades as a rate limit (see isProvenRateLimit).
+		if isProvenRateLimit(err) {
+			if stale, ok := staleTrustPolicies.Get(tpKey); ok {
+				clog.InfoContextf(ctx, "rate-limited, serving stale cached trust policy for %s", tpKey)
+				// Seed the primary cache so further exchanges during the
+				// rate-limit window hit it instead of re-probing GitHub.
+				trustPolicies.Add(tpKey, stale)
+				return stale, nil
+			}
+			return "", backoff.Permanent(status.Errorf(codes.ResourceExhausted, "GitHub API rate limit exceeded for %q", tpKey.identity))
+		}
+		// A bare 403 is permission-denied, not a rate limit. Fail closed: do not
+		// rotate apps in lookupTrustPolicyWithRetry, which keys off
+		// ResourceExhausted, and drop any stale copy. Access may have been
+		// revoked, so leaving the stale entry would let a later proven rate limit
+		// on this key serve it (and re-seed the primary cache) after GitHub has
+		// already refused the read. A permission problem is not one another app
+		// can resolve. Seed the cooldown so the next exchange short-circuits
+		// instead of re-minting a token to re-probe the same 403.
+		if isForbidden(err) {
+			clog.WarnContextf(ctx, "trust policy read forbidden for %q (403, not a rate limit): %v", tpKey.identity, err)
+			staleTrustPolicies.Remove(tpKey)
+			forbiddenPolicies.Add(tpKey, struct{}{})
+			return "", backoff.Permanent(status.Errorf(codes.PermissionDenied, "trust policy read forbidden for %q (not a rate limit)", tpKey.identity))
+		}
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotFound {
+			trustPolicies.Add(tpKey, negativeCacheConst)
+			return "", backoff.Permanent(status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity))
+		}
+		if isTransient(err) {
+			return "", err
+		}
+		return "", backoff.Permanent(status.Errorf(codes.NotFound, "unable to find trust policy for %q", tpKey.identity))
+	}
+
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.InitialInterval = retryDelay
+	raw, err := backoff.Retry(ctx, op, backoff.WithBackOff(expBackoff), backoff.WithMaxTries(maxRetry))
+	if err != nil {
+		// backoff returns the *PermanentError wrapper when the try limit and a
+		// Permanent stop coincide on the last attempt; unwrap so the checks
+		// below see the underlying error.
+		var pe *backoff.PermanentError
+		if errors.As(err, &pe) {
+			err = pe.Unwrap()
+		}
+		// A deadline during a backoff sleep surfaces here as a raw context
+		// error, not a gRPC status; report it as a context error rather than
+		// as a GitHub transient. The flight maps it to Unavailable.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", status.FromContextError(err).Err()
+		}
+		// Permanent classifications are already gRPC status errors; a bare error
+		// here is the transient class that exhausted its retries.
+		if _, ok := status.FromError(err); ok {
+			return "", err
+		}
+		// The cause stays in the log. The caller has not been checked against
+		// the policy yet, and a failed token mint names the installation ID.
+		clog.WarnContextf(ctx, "transient error fetching trust policy for %q: %v", tpKey.identity, err)
+		return "", status.Errorf(codes.Unavailable, "transient error fetching trust policy for %q", tpKey.identity)
+	}
+	return raw, nil
+}
+
+// isTransient reports whether err is a retriable, non-rate-limit failure from a
+// trust policy fetch: a 5xx GitHub response, or a transport / token-creation
+// error with no HTTP response at all. Context cancellation and deadline end the
+// read outright, so they are deliberately excluded.
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ghErr *github.ErrorResponse
+	if errors.As(err, &ghErr) {
+		return ghErr.Response != nil && ghErr.Response.StatusCode >= 500
+	}
+	// Installation-token creation surfaces as *ghinstallation.HTTPError, not a
+	// go-github error. A permanent 401/404 (bad key, app not installed) must not
+	// be retried; only a 5xx mint failure is transient.
+	var httpErr *ghinstallation.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Response != nil && httpErr.Response.StatusCode >= 500
+	}
+	// No HTTP response at all: transport, DNS, or TLS.
+	return true
 }
 
 // ExchangeRefreshToken implements pboidc.SecurityTokenServiceServer
@@ -445,6 +1229,11 @@ func (s *sts) ExchangeRefreshToken(ctx context.Context, request *pboidc.Exchange
 	return nil, status.Error(codes.Unimplemented, "octo-sts does not support refresh tokens")
 }
 
-func ptr[T any](in T) *T {
-	return &in
+func extractUserAgent(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	ua := md.Get("user-agent")
+	return strings.Join(ua, " ")
 }

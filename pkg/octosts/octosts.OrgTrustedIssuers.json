@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/octo-sts/app/pkg/octosts/org-trusted-issuers",
+  "$ref": "#/$defs/OrgTrustedIssuers",
+  "$defs": {
+    "OrgTrustedIssuers": {
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "enforce",
+            "audit"
+          ]
+        },
+        "issuers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Issuers is matched byte-exactly."
+        },
+        "issuer_patterns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "IssuerPatterns are anchored regexps matching the entire issuer URL."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "OrgTrustedIssuers is an org-wide allowlist of OIDC issuers read from OrgTrustedIssuersPath; when present, only issuers it permits may federate."
+    }
+  }
+}

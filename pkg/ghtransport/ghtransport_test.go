@@ -9,20 +9,108 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
-	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
-	kms "cloud.google.com/go/kms/apiv1"
+	gkms "cloud.google.com/go/kms/apiv1"
+	"github.com/bradleyfalzon/ghinstallation/v2"
+	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/octo-sts/app/pkg/appconfig"
 	"github.com/octo-sts/app/pkg/envconfig"
+	"github.com/octo-sts/app/pkg/ghinstall"
+	"github.com/octo-sts/app/pkg/kms"
+	"github.com/octo-sts/app/pkg/kms/gcp"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+func TestQuotaTapPopulatesStore(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "8421")
+		w.Header().Set("X-RateLimit-Limit", "15000")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	store := ghinstall.NewQuotaStore(time.Minute)
+	tap := &quotaTap{inner: http.DefaultTransport, store: store}
+	client := &http.Client{Transport: tap}
+
+	const installID = int64(987654)
+	req, err := http.NewRequestWithContext(EnrichContext(context.Background(), 12345, installID), http.MethodGet, srv.URL, nil)
+	assert.NoError(t, err)
+	// Simulate an installation-token request (ghinstallation uses "token " prefix).
+	req.Header.Set("Authorization", "token ghs_fake_installation_token")
+	resp, err := client.Do(req)
+	assert.NoError(t, err)
+	resp.Body.Close()
+
+	rem, lim, ok := store.Get(installID)
+	assert.True(t, ok, "quota store should be populated after a tapped response")
+	assert.Equal(t, 8421, rem)
+	assert.Equal(t, 15000, lim)
+}
+
+func TestQuotaTapIgnoresJWTAuth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "4900")
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	store := ghinstall.NewQuotaStore(time.Minute)
+	tap := &quotaTap{inner: http.DefaultTransport, store: store}
+	client := &http.Client{Transport: tap}
+
+	const installID = int64(987654)
+	req, err := http.NewRequestWithContext(EnrichContext(context.Background(), 12345, installID), http.MethodGet, srv.URL, nil)
+	assert.NoError(t, err)
+	// Simulate an app-JWT request (ghinstallation uses "Bearer " prefix).
+	// The 5000 limit is the app-level rate limit, not per-installation.
+	req.Header.Set("Authorization", "Bearer eyJhbGciOiJSUzI1NiJ9.fake.jwt")
+	resp, err := client.Do(req)
+	assert.NoError(t, err)
+	resp.Body.Close()
+
+	if _, _, ok := store.Get(installID); ok {
+		t.Errorf("store populated for JWT request — app-level rate limits must not be recorded")
+	}
+}
+
+func TestQuotaTapIgnoresMissingContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "1234")
+		w.Header().Set("X-RateLimit-Limit", "15000")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	store := ghinstall.NewQuotaStore(time.Minute)
+	tap := &quotaTap{inner: http.DefaultTransport, store: store}
+	client := &http.Client{Transport: tap}
+
+	// Plain context with no EnrichContext → no installID → no store update.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	assert.NoError(t, err)
+	resp, err := client.Do(req)
+	assert.NoError(t, err)
+	resp.Body.Close()
+
+	if _, _, ok := store.Get(0); ok {
+		t.Errorf("store unexpectedly populated for installID=0")
+	}
+}
 
 func TestGCPKMS(t *testing.T) {
 	ctx := context.Background()
@@ -34,15 +122,19 @@ func TestGCPKMS(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsFile)
 
 	testConfig := &envconfig.EnvConfig{
-		Port:    8080,
-		AppIDs:  []int64{12345678, 87654321},
-		KMSKeys: []string{"test-kms-key-1", "test-kms-key-2"},
-		Metrics: true,
+		Port:        8080,
+		AppIDs:      []int64{12345678, 87654321},
+		KMSKeys:     []string{"test-kms-key-1", "test-kms-key-2"},
+		KMSProvider: "gcp",
+		Metrics:     true,
 	}
 
-	kmsClient := generateKMSClient(ctx, t)
 	for i, appID := range testConfig.AppIDs {
-		transport, err := New(ctx, appID, testConfig.KMSKeys[i], testConfig, kmsClient)
+		kmsClient, err := kms.NewKMS(ctx, testConfig.KMSProvider, testConfig.KMSKeys[i])
+		if err != nil {
+			t.Fatalf("Failed to create KMS: %s", err)
+		}
+		transport, err := New(ctx, appID, testConfig.KMSKeys[i], testConfig, kmsClient, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, transport)
 	}
@@ -58,9 +150,8 @@ func TestCertEnvVar(t *testing.T) {
 		Metrics:                    true,
 	}
 
-	kmsClient := generateKMSClient(ctx, t)
 	for _, appID := range testConfig.AppIDs {
-		transport, err := New(ctx, appID, "", testConfig, kmsClient)
+		transport, err := New(ctx, appID, "", testConfig, nil, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, transport)
 	}
@@ -76,22 +167,101 @@ func TestCertFile(t *testing.T) {
 		Metrics:                  true,
 	}
 
-	kmsClient := generateKMSClient(ctx, t)
 	for _, appID := range testConfig.AppIDs {
-		transport, err := New(ctx, appID, "", testConfig, kmsClient)
+		transport, err := New(ctx, appID, "", testConfig, nil, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, transport)
 	}
 }
 
-func generateKMSClient(ctx context.Context, t *testing.T) *kms.KeyManagementClient {
+func TestGitHubBaseURLPropagated(t *testing.T) {
+	ctx := context.Background()
+
+	testConfig := &envconfig.EnvConfig{
+		Port:                       8080,
+		AppIDs:                     []int64{12345678},
+		AppSecretCertificateEnvVar: generateTestCertificateString(),
+		GitHubBaseURL:              "https://github.example.com/api/v3",
+		Metrics:                    true,
+	}
+
+	kmsClient := generateKMSClient(ctx, t)
+	transport, err := New(ctx, testConfig.AppIDs[0], "", testConfig, kmsClient, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, transport)
+	assert.Equal(t, "https://github.example.com/api/v3", transport.BaseURL)
+}
+
+func TestGitHubBaseURLEmptyKeepsDefault(t *testing.T) {
+	ctx := context.Background()
+
+	testConfig := &envconfig.EnvConfig{
+		Port:                       8080,
+		AppIDs:                     []int64{12345678},
+		AppSecretCertificateEnvVar: generateTestCertificateString(),
+		GitHubBaseURL:              "",
+		Metrics:                    true,
+	}
+
+	kmsClient := generateKMSClient(ctx, t)
+	transport, err := New(ctx, testConfig.AppIDs[0], "", testConfig, kmsClient, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, transport)
+	// Default ghinstallation base URL when not overridden.
+	assert.Equal(t, "https://api.github.com", transport.BaseURL)
+}
+
+func TestNewFromAppConfigKMS(t *testing.T) {
+	ctx := context.Background()
+	credsFile := createGCPKMSCredsFile(t)
+	defer os.Remove(credsFile)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsFile)
+
+	kmsClient := generateKMSClient(ctx, t)
+	transport, err := NewFromAppConfig(ctx, appconfig.AppConfig{
+		AppID:  12345678,
+		KMSKey: "test-kms-key",
+	}, &envconfig.EnvConfig{}, kmsClient, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, transport)
+}
+
+func TestNewFromAppConfigPrivateKey(t *testing.T) {
+	ctx := context.Background()
+	transport, err := NewFromAppConfig(ctx, appconfig.AppConfig{
+		AppID:      12345678,
+		PrivateKey: generateTestCertificateString(),
+	}, &envconfig.EnvConfig{}, nil, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, transport)
+}
+
+func TestNewFromAppConfigPrivateKeyFile(t *testing.T) {
+	ctx := context.Background()
+	transport, err := NewFromAppConfig(ctx, appconfig.AppConfig{
+		AppID:          12345678,
+		PrivateKeyFile: generateTestCertificateFile(t),
+	}, &envconfig.EnvConfig{}, nil, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, transport)
+}
+
+func TestNewFromAppConfigNoCredential(t *testing.T) {
+	ctx := context.Background()
+	_, err := NewFromAppConfig(ctx, appconfig.AppConfig{
+		AppID: 12345678,
+	}, &envconfig.EnvConfig{}, nil, nil)
+	assert.Error(t, err)
+}
+
+func generateKMSClient(ctx context.Context, t *testing.T) kms.KMS {
 	l, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	fakeServerAddr := l.Addr().String()
 
-	client, err := kms.NewKeyManagementClient(ctx,
+	client, err := gkms.NewKeyManagementClient(ctx,
 		option.WithEndpoint(fakeServerAddr),
 		option.WithoutAuthentication(),
 		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
@@ -100,7 +270,12 @@ func generateKMSClient(ctx context.Context, t *testing.T) *kms.KeyManagementClie
 		t.Fatal(err)
 	}
 
-	return client
+	provider, err := gcp.NewProviderWithClient(ctx, client, "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return provider
 }
 
 func createGCPKMSCredsFile(t *testing.T) string {
@@ -109,12 +284,18 @@ func createGCPKMSCredsFile(t *testing.T) string {
 		t.Fatalf("Failed to create temporary file: %s", err)
 	}
 
-	jsonStr := fmt.Sprintf(`{
-        "type": "service_account",
-        "private_key": "%s"
-    }`, generateTestCertificateString())
+	// Create proper JSON with escaped private key
+	creds := map[string]any{
+		"type":        "service_account",
+		"private_key": generateTestCertificateString(),
+	}
 
-	if _, err := tmpFile.Write([]byte(jsonStr)); err != nil {
+	jsonBytes, err := json.Marshal(creds)
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %s", err)
+	}
+
+	if _, err := tmpFile.Write(jsonBytes); err != nil {
 		t.Fatalf("Failed to write to temporary file: %s", err)
 	}
 	if err := tmpFile.Close(); err != nil {
@@ -164,4 +345,46 @@ func generateTestCertificateFile(t *testing.T) string {
 	}
 
 	return tmpFile.Name()
+}
+
+func TestForInstallationDoesNotShareAppsTransport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"token":      "installation-token",
+			"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+		})
+	}))
+	t.Cleanup(srv.Close)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := ghinstallation.NewRSASigner(jwt.SigningMethodRS256, key)
+	base, err := ghinstallation.NewAppsTransportWithOptions(http.DefaultTransport, 1234, ghinstallation.WithSigner(signer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.BaseURL = srv.URL
+	baseClient := base.Client
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := ForInstallation(base, int64(i+1)).Token(t.Context())
+			if err != nil {
+				t.Errorf("installation %d: %v", i+1, err)
+				return
+			}
+			if tok != "installation-token" {
+				t.Errorf("installation %d token = %q", i+1, tok)
+			}
+		}()
+	}
+	wg.Wait()
+	// Token refresh writes Client back into the AppsTransport it was derived
+	// from; a shared base would have been replaced by the first refresh.
+	assert.Same(t, baseClient, base.Client)
+	assert.Equal(t, srv.URL, base.BaseURL)
 }

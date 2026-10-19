@@ -78,4 +78,8 @@ module "app" {
 
   github_apps           = var.github_apps
   notification_channels = local.notification_channels
+  sticky_store          = "firestore"
+  # Mirrors prod: reads refresh expire_at, so the TTL only reaps idle
+  # mappings and must exceed the longest consumer exchange cadence.
+  sticky_store_firestore_ttl = "720h"
 }

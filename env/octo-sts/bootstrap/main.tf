@@ -8,6 +8,13 @@ resource "google_project_service" "iamcredentials-api" {
   disable_on_destroy         = false
 }
 
+resource "google_project_service" "firestore-api" {
+  project                    = var.project_id
+  service                    = "firestore.googleapis.com"
+  disable_dependent_services = false
+  disable_on_destroy         = false
+}
+
 data "google_monitoring_notification_channel" "notify-chainguard-slack" {
   display_name = "Slack Octo STS Notification"
 }
@@ -47,9 +54,12 @@ module "github_identity" {
   name       = "github-identity"
   wif-pool   = module.github-wif.pool_name
 
-  repository   = "octo-sts/app"
-  refspec      = "refs/heads/main"
-  workflow_ref = ".github/workflows/deploy.yaml"
+  repository = "octo-sts/app"
+  # Production deploys run from deploy-prod.yaml on version tags (vX.Y.Z), not
+  # from main (split out so prod can be disabled independently in the Actions
+  # UI). Staging stays on deploy.yaml.
+  refspec      = "version_tags"
+  workflow_ref = ".github/workflows/deploy-prod.yaml"
 
   notification_channels = local.notification_channels
 }

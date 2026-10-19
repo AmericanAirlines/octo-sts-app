@@ -92,6 +92,210 @@ func TestBaseConfig(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			// Azure key identifiers are self-describing and travel in
+			// KMS_KEYS, so they are validated by the generic KMS rules.
+			name: "AKV keys supplied via KMS_KEYS",
+			envVars: map[string]string{
+				"PORT":           "8080",
+				"GITHUB_APP_IDS": "12345678,87654321",
+				"KMS_PROVIDER":   "akv",
+				"KMS_KEYS":       "https://vault-a.vault.azure.net/keys/key-1,https://vault-b.vault.azure.net/keys/key-2/v2",
+			},
+			wantErr: false,
+		},
+		{
+			name: "AKV keys length mismatch with app count",
+			envVars: map[string]string{
+				"PORT":           "8080",
+				"GITHUB_APP_IDS": "12345678,87654321",
+				"KMS_PROVIDER":   "akv",
+				"KMS_KEYS":       "https://vault-a.vault.azure.net/keys/key-1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Quota floors valid",
+			envVars: map[string]string{
+				"PORT":                     "8080",
+				"GITHUB_APP_IDS":           "12345678",
+				"OCTOSTS_QUOTA_FLOOR_HARD": "1500",
+				"OCTOSTS_QUOTA_FLOOR_SOFT": "15000",
+				"OCTOSTS_QUOTA_STALE":      "5m",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Quota soft floor must be >= hard floor",
+			envVars: map[string]string{
+				"PORT":                     "8080",
+				"GITHUB_APP_IDS":           "12345678",
+				"OCTOSTS_QUOTA_FLOOR_HARD": "5000",
+				"OCTOSTS_QUOTA_FLOOR_SOFT": "1500",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Quota floors equal is allowed",
+			envVars: map[string]string{
+				"PORT":                     "8080",
+				"GITHUB_APP_IDS":           "12345678",
+				"OCTOSTS_QUOTA_FLOOR_HARD": "1500",
+				"OCTOSTS_QUOTA_FLOOR_SOFT": "1500",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Negative floor rejected",
+			envVars: map[string]string{
+				"PORT":                     "8080",
+				"GITHUB_APP_IDS":           "12345678",
+				"OCTOSTS_QUOTA_FLOOR_HARD": "-1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Zero stale duration rejected",
+			envVars: map[string]string{
+				"PORT":                "8080",
+				"GITHUB_APP_IDS":      "12345678",
+				"OCTOSTS_QUOTA_STALE": "0s",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Negative stale duration rejected",
+			envVars: map[string]string{
+				"PORT":                "8080",
+				"GITHUB_APP_IDS":      "12345678",
+				"OCTOSTS_QUOTA_STALE": "-5m",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Sticky store firestore valid",
+			envVars: map[string]string{
+				"PORT":                               "8080",
+				"GITHUB_APP_IDS":                     "12345678",
+				"OCTOSTS_STICKY_STORE":               "firestore",
+				"OCTOSTS_STICKY_STORE_FIRESTORE_TTL": "1h",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Sticky store disabled by default",
+			envVars: map[string]string{
+				"PORT":           "8080",
+				"GITHUB_APP_IDS": "12345678",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Sticky store invalid backend rejected",
+			envVars: map[string]string{
+				"PORT":                 "8080",
+				"GITHUB_APP_IDS":       "12345678",
+				"OCTOSTS_STICKY_STORE": "redis",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Sticky store negative TTL rejected",
+			envVars: map[string]string{
+				"PORT":                               "8080",
+				"GITHUB_APP_IDS":                     "12345678",
+				"OCTOSTS_STICKY_STORE":               "firestore",
+				"OCTOSTS_STICKY_STORE_FIRESTORE_TTL": "-1h",
+			},
+			wantErr: true,
+		},
+		{
+			name: "GITHUB_BASE_URL valid HTTPS",
+			envVars: map[string]string{
+				"PORT":            "8080",
+				"GITHUB_APP_IDS":  "12345678",
+				"GITHUB_BASE_URL": "https://github.example.com/api/v3",
+			},
+			wantErr: false,
+		},
+		{
+			name: "GITHUB_BASE_URL rejects HTTP",
+			envVars: map[string]string{
+				"PORT":            "8080",
+				"GITHUB_APP_IDS":  "12345678",
+				"GITHUB_BASE_URL": "http://github.example.com/api/v3",
+			},
+			wantErr: true,
+		},
+		{
+			name: "GITHUB_BASE_URL rejects invalid URL",
+			envVars: map[string]string{
+				"PORT":            "8080",
+				"GITHUB_APP_IDS":  "12345678",
+				"GITHUB_BASE_URL": "://not-a-url",
+			},
+			wantErr: true,
+		},
+		{
+			name: "GITHUB_BASE_URL empty is allowed",
+			envVars: map[string]string{
+				"PORT":            "8080",
+				"GITHUB_APP_IDS":  "12345678",
+				"GITHUB_BASE_URL": "",
+			},
+			wantErr: false,
+		},
+		{
+			// BaseConfig only records the path; the file is read later by
+			// pkg/appconfig, so it doesn't need to exist here.
+			name: "APP_CONFIG_FILE set bypasses GITHUB_APP_IDS requirement",
+			envVars: map[string]string{
+				"PORT":            "8080",
+				"APP_CONFIG_FILE": "/etc/octo-sts/config.yaml",
+			},
+			wantErr: false,
+		},
+		{
+			name: "GITHUB_APP_IDS required when APP_CONFIG_FILE unset",
+			envVars: map[string]string{
+				"PORT": "8080",
+			},
+			wantErr: true,
+		},
+		{
+			// Legacy credential validation is skipped by design when the
+			// YAML config is in use: credentials come from the config file,
+			// so conflicting legacy env vars are ignored rather than fatal.
+			name: "APP_CONFIG_FILE skips legacy credential validation",
+			envVars: map[string]string{
+				"PORT":                        "8080",
+				"APP_CONFIG_FILE":             "/etc/octo-sts/config.yaml",
+				"GITHUB_APP_IDS":              "12345678,87654321",
+				"KMS_KEYS":                    "only-one-key",
+				"APP_SECRET_CERTIFICATE_FILE": "some-file-path",
+			},
+			wantErr: false,
+		},
+		{
+			name: "OCTOSTS_ALLOWED_ISSUERS accepts a list of issuers",
+			envVars: map[string]string{
+				"PORT":                        "8080",
+				"GITHUB_APP_IDS":              "12345678",
+				"APP_SECRET_CERTIFICATE_FILE": "some-file-path",
+				"OCTOSTS_ALLOWED_ISSUERS":     "https://token.actions.githubusercontent.com,https://accounts.example.com",
+			},
+			wantErr: false,
+		},
+		{
+			name: "OCTOSTS_ALLOWED_ISSUERS rejects an entry no issuer can equal",
+			envVars: map[string]string{
+				"PORT":                        "8080",
+				"GITHUB_APP_IDS":              "12345678",
+				"APP_SECRET_CERTIFICATE_FILE": "some-file-path",
+				"OCTOSTS_ALLOWED_ISSUERS":     "not-a-url",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -142,6 +346,38 @@ func TestAppConfig(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "ORG_POLICY_REPO explicitly empty rejected",
+			envVars: map[string]string{
+				"STS_DOMAIN":      "octo-sts-test.local",
+				"ORG_POLICY_REPO": "",
+			},
+			wantErr: true,
+		},
+		{
+			name: "ORG_POLICY_REPO custom value accepted",
+			envVars: map[string]string{
+				"STS_DOMAIN":      "octo-sts-test.local",
+				"ORG_POLICY_REPO": "my-policies",
+			},
+			wantErr: false,
+		},
+		{
+			name: "OCTOSTS_POLICY_DIR explicitly empty rejected",
+			envVars: map[string]string{
+				"STS_DOMAIN":         "octo-sts-test.local",
+				"OCTOSTS_POLICY_DIR": "",
+			},
+			wantErr: true,
+		},
+		{
+			name: "OCTOSTS_POLICY_DIR custom value accepted",
+			envVars: map[string]string{
+				"STS_DOMAIN":         "octo-sts-test.local",
+				"OCTOSTS_POLICY_DIR": ".github/octo-sts",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -188,6 +424,22 @@ func TestWebhookConfig(t *testing.T) {
 			envVars: map[string]string{},
 			wantErr: true,
 		},
+		{
+			name: "OCTOSTS_POLICY_DIR with parent segment rejected",
+			envVars: map[string]string{
+				"GITHUB_WEBHOOK_SECRET": "octo-sts-test.local",
+				"OCTOSTS_POLICY_DIR":    "../policies",
+			},
+			wantErr: true,
+		},
+		{
+			name: "OCTOSTS_POLICY_DIR custom value accepted",
+			envVars: map[string]string{
+				"GITHUB_WEBHOOK_SECRET": "octo-sts-test.local",
+				"OCTOSTS_POLICY_DIR":    ".github/octo-sts",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -204,6 +456,48 @@ func TestWebhookConfig(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 				assert.NotNil(t, cfg)
+			}
+		})
+	}
+}
+
+func TestPolicyDirDefault(t *testing.T) {
+	t.Setenv("STS_DOMAIN", "octo-sts-test.local")
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "octo-sts-test.local")
+
+	app, err := AppConfig()
+	assert.NoError(t, err)
+	assert.Equal(t, ".github/chainguard", app.PolicyDir)
+
+	webhook, err := WebhookConfig()
+	assert.NoError(t, err)
+	assert.Equal(t, ".github/chainguard", webhook.PolicyDir)
+}
+
+func TestValidatePolicyDir(t *testing.T) {
+	for _, tc := range []struct {
+		dir     string
+		wantErr bool
+	}{
+		{dir: ".github/chainguard"},
+		{dir: ".github/octo-sts"},
+		{dir: "octo-sts"},
+		{dir: "infra/github/octo-sts"},
+		{dir: "", wantErr: true},
+		{dir: ".", wantErr: true},
+		{dir: "/.github/octo-sts", wantErr: true},
+		{dir: ".github/octo-sts/", wantErr: true},
+		{dir: ".github//octo-sts", wantErr: true},
+		{dir: "./.github/octo-sts", wantErr: true},
+		{dir: ".github/../octo-sts", wantErr: true},
+		{dir: `.github\octo-sts`, wantErr: true},
+	} {
+		t.Run(tc.dir, func(t *testing.T) {
+			err := validatePolicyDir(tc.dir)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}

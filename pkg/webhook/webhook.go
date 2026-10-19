@@ -12,16 +12,22 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/chainguard-dev/clog"
-	"github.com/google/go-github/v84/github"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/google/go-github/v88/github"
 	"github.com/hashicorp/go-multierror"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/yaml"
 
+	"github.com/octo-sts/app/pkg/ghtransport"
 	"github.com/octo-sts/app/pkg/octosts"
 )
 
@@ -36,7 +42,309 @@ const (
 	// zeroHash is a special SHA value indicating a non-existent commit,
 	// i.e. when a branch is newly created or destroyed.
 	zeroHash = "0000000000000000000000000000000000000000"
+
+	// checkRunName is the name of the check run the validator posts. Repositories
+	// make it a required status check, so it must stay stable.
+	checkRunName = "Trust Policy Validation"
+
+	// noPolicyChangesTitle is the check run title when an event changed no
+	// trust policy.
+	noPolicyChangesTitle = "No trust policy changes."
+
+	// policiesRemovedTitle is the check run title when an event only removed
+	// trust policies.
+	policiesRemovedTitle = "Trust policies removed."
 )
+
+type PolicyAction string
+
+const (
+	PolicyCreated PolicyAction = "created"
+	PolicyUpdated PolicyAction = "updated"
+	PolicyDeleted PolicyAction = "deleted"
+	// PolicyPresent means the policy is live at the pushed commit but this
+	// push's effect on it is unknown. It is only produced when a forced push
+	// leaves the previous SHA unresolvable, so there is no prior state to
+	// compare against and no honest way to say whether the policy was created,
+	// updated, or left alone. Always accompanied by DetectionDegraded.
+	PolicyPresent PolicyAction = "present"
+)
+
+type PolicyChange struct {
+	Path   string       `json:"path"`
+	Policy string       `json:"policy"`
+	Action PolicyAction `json:"action"`
+}
+
+// DetectionMethod records how a push's policy changes were derived. An audit
+// consumer needs this to know how much weight a record carries: a snapshot is
+// an authoritative before/after comparison of what is live, while the commit
+// and compare paths mirror the diffs GitHub volunteers and can therefore be
+// incomplete if history is rewritten under them.
+type DetectionMethod string
+
+const (
+	// DetectionCommits derived changes from the push payload's commit list.
+	DetectionCommits DetectionMethod = "commits"
+	// DetectionCompare derived changes directly from the Compare API, used
+	// when the payload's commit list is truncated and the response is complete.
+	DetectionCompare DetectionMethod = "compare"
+	// DetectionSnapshot derived changes by diffing the policy directory at the
+	// pushed SHA against the ref's previous SHA. Used for forced pushes and
+	// comparisons at GitHub's file cap.
+	DetectionSnapshot DetectionMethod = "snapshot"
+	// DetectionDegraded means change detection could not be completed and the
+	// accompanying changes, if any, may be incomplete. Always accompanied by a
+	// push-level event with no change attached, so the gap is visible in the
+	// stream rather than silently absent from it. Any policy records alongside
+	// it carry PolicyPresent: they say what is live at the pushed commit, not
+	// what this push did.
+	DetectionDegraded DetectionMethod = "degraded"
+)
+
+type PolicyEvent struct {
+	Org            string `json:"org"`
+	Repo           string `json:"repo"`
+	Ref            string `json:"ref"`
+	Commit         string `json:"commit"`
+	Before         string `json:"before"`
+	InstallationID int64  `json:"installation_id"`
+	Actor          string `json:"actor"`
+	ActorID        int64  `json:"actor_id"`
+	Pusher         string `json:"pusher"`
+	Forced         bool   `json:"forced"`
+	// Change is the policy this event describes, and is absent on a push-level
+	// event — currently only the marker emitted when Detection is
+	// DetectionDegraded. ChangeIndex and ChangeCount are meaningful only when
+	// Change is present.
+	Change *PolicyChange `json:"change,omitempty"`
+	// Detection records how Change was derived, and DetectionError explains a
+	// DetectionDegraded result. A consumer treating this stream as an audit
+	// trail should surface anything that is not DetectionSnapshot or
+	// DetectionCommits as reduced assurance.
+	Detection      DetectionMethod `json:"detection"`
+	DetectionError string          `json:"detection_error,omitempty"`
+	// ChangeIndex and ChangeCount locate this event within its push. Delivery
+	// is per-event and best-effort, so a push can land partially; a consumer
+	// that groups by Commit can compare the rows it holds against ChangeCount
+	// to detect the gap. They also restore the grouping that emitting one
+	// event per policy otherwise loses, e.g. spotting a bulk policy rewrite.
+	ChangeIndex int `json:"change_index"`
+	ChangeCount int `json:"change_count"`
+	// Valid reports whether THIS policy parsed at Commit, and is nil when the
+	// policy was never read: deletions (the path no longer exists at Commit),
+	// a validation pass aborted by GitHub rate limiting, or a push that failed
+	// before validation ran. A nil Valid must not be read as "valid" — it means
+	// unknown. Except for deletions, PushError explains why.
+	Valid *bool `json:"valid"`
+	// Error is this policy's own validation failure, not the push's aggregate.
+	Error string `json:"error,omitempty"`
+	// PushError records a failure encountered while handling this push — a
+	// rate limit that cut validation short, or a check run that could not be
+	// created. It describes the push, not this policy, and specifically does
+	// not imply that this policy went unvalidated: a non-nil Valid alongside
+	// a PushError is an authoritative verdict on a push that had trouble
+	// elsewhere. Read Valid, not PushError, to decide whether a verdict exists.
+	PushError string    `json:"push_error,omitempty"`
+	Time      time.Time `json:"time"`
+}
+
+// OrgTrustedIssuersPolicyName is the Policy value used for the organization
+// trusted-issuer allowlist, which is not a named trust policy and so has no
+// name of its own. A sentinel keeps every event's subject well-formed rather
+// than leaving a trailing separator, and stays distinguishable from a real
+// policy because "." cannot appear in a *.sts.yaml basename stem here.
+const OrgTrustedIssuersPolicyName = ".trusted-token-issuers"
+
+// policyName extracts the policy identity from a validated path:
+// ".github/chainguard/foo.sts.yaml" -> "foo".
+func policyName(path string) string {
+	base := filepath.Base(path)
+	stem, found := strings.CutSuffix(base, ".sts.yaml")
+	if !found {
+		return OrgTrustedIssuersPolicyName
+	}
+	if stem == "" {
+		// A literal ".sts.yaml" matches the glob octo-sts validates but leaves
+		// no stem, which would degenerate the event subject to "org/repo/".
+		// Fall back to the filename so the subject stays well-formed.
+		return base
+	}
+	return stem
+}
+
+func (e *Validator) policyChangesFromPushEvent(repo string, event *github.PushEvent) []PolicyChange {
+	byPath := make(map[string]PolicyAction)
+
+	apply := func(paths []string, action PolicyAction) {
+		for _, p := range filterValidatedFiles(repo, paths, e.policyRepo(), e.policyDir()) {
+			switch prev, seen := byPath[p]; {
+			case !seen:
+				byPath[p] = action
+			case prev == PolicyCreated && action == PolicyUpdated:
+				// Created then edited in the same push is still a creation.
+			default:
+				byPath[p] = action
+			}
+		}
+	}
+
+	for _, commit := range event.Commits {
+		apply(commit.Added, PolicyCreated)
+		apply(commit.Modified, PolicyUpdated)
+		apply(commit.Removed, PolicyDeleted)
+	}
+
+	changes := make([]PolicyChange, 0, len(byPath))
+	for path, action := range byPath {
+		changes = append(changes, PolicyChange{
+			Path:   path,
+			Policy: policyName(path),
+			Action: action,
+		})
+	}
+	// Stable output so consumers diffing records don't see spurious churn.
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	return changes
+}
+
+// policyChangesFromCompare derives policy changes from a CompareCommits (or
+// ListFiles) response.
+//
+// This is the path taken when the push payload's commit list is truncated, and
+// it is the only path that sees renames: GitHub reports a rename as a single
+// entry for the new path plus a PreviousFilename, so a policy renamed from a to
+// b is recorded as b created and a deleted.
+func (e *Validator) policyChangesFromCompare(ctx context.Context, repo string, files []*github.CommitFile) []PolicyChange {
+	log := clog.FromContext(ctx)
+
+	var changes []PolicyChange //nolint:prealloc // most files in a push aren't policies
+
+	add := func(path string, action PolicyAction) {
+		if !isValidatedPath(repo, path, e.policyRepo(), e.policyDir()) {
+			return
+		}
+		changes = append(changes, PolicyChange{
+			Path:   path,
+			Policy: policyName(path),
+			Action: action,
+		})
+	}
+
+	for _, file := range files {
+		switch status := file.GetStatus(); status {
+		case "added", "copied":
+			add(file.GetFilename(), PolicyCreated)
+		case "removed":
+			add(file.GetFilename(), PolicyDeleted)
+		case "renamed":
+			add(file.GetFilename(), PolicyCreated)
+			add(file.GetPreviousFilename(), PolicyDeleted)
+		case "modified", "changed":
+			add(file.GetFilename(), PolicyUpdated)
+		case "unchanged":
+			// GitHub includes unchanged entries in some compares. The file is
+			// byte-identical across the range, so nothing happened to this
+			// policy in this push and reporting an update would be a lie.
+		default:
+			// An unrecognised status is more likely a new GitHub value than a
+			// non-event, so report it as an update rather than dropping it —
+			// over-reporting a change is the safer failure for a signal meant
+			// to catch policy movement. Log it so the gap can be closed.
+			log.Warnf("unrecognised compare status %q for %s; recording as an update", status, file.GetFilename())
+			add(file.GetFilename(), PolicyUpdated)
+		}
+	}
+
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	return changes
+}
+
+// policyChangesFromSnapshot derives policy changes by comparing the policies
+// live at before with those live at after. It also returns the snapshot taken
+// at after, which stays usable when only before fails to resolve.
+//
+// This is the only detection path that survives a history rewrite. The commit
+// and compare paths both describe the commits a push carries, which for a
+// forced push does not describe its effect on the branch: a rewind that
+// restores a deleted policy carries no commits at all and three-dot-compares
+// as empty, so those paths would report nothing while the policy became live
+// again. Comparing state instead of commits reports the restoration.
+func (e *Validator) policyChangesFromSnapshot(ctx context.Context, client *github.Client, owner, repo, before, after string) ([]PolicyChange, map[string]string, error) {
+	// after is the SHA this push just placed on the branch, so it resolves
+	// whenever the push itself was real. before is the one GitHub is free to
+	// garbage collect after a rewind, so take after first: that way a failure
+	// to resolve before still leaves the caller a live listing to fall back on.
+	//
+	// policyTreeSnapshot resolves the commit before walking its tree, so an
+	// unreachable ref is an error rather than an empty snapshot that would
+	// report every live policy as deleted. It also rejects truncated trees, so
+	// a large policy directory fails loudly instead of listing partially.
+	afterSnap, err := e.policyTreeSnapshot(ctx, client, owner, repo, after)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// A push that creates the ref has no prior state to compare against.
+	beforeSnap := map[string]string{}
+	if before != "" && before != zeroHash {
+		if beforeSnap, err = e.policyTreeSnapshot(ctx, client, owner, repo, before); err != nil {
+			return nil, afterSnap, err
+		}
+	}
+
+	var changes []PolicyChange //nolint:prealloc // most pushes change no policies
+	add := func(path string, action PolicyAction) {
+		changes = append(changes, PolicyChange{Path: path, Policy: policyName(path), Action: action})
+	}
+	for path, sha := range afterSnap {
+		switch prev, existed := beforeSnap[path]; {
+		case !existed:
+			add(path, PolicyCreated)
+		case prev != sha:
+			add(path, PolicyUpdated)
+		}
+	}
+	for path := range beforeSnap {
+		if _, ok := afterSnap[path]; !ok {
+			add(path, PolicyDeleted)
+		}
+	}
+
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	return changes, afterSnap, nil
+}
+
+// policiesPresent reports every policy in a snapshot as PolicyPresent.
+//
+// Used when a forced push leaves the previous SHA unresolvable. The diff
+// cannot be computed, but the live listing still answers "which policies are
+// in force at this commit" — enough to keep the check-run gate and to put a
+// per-policy record in the stream, instead of only a content-free marker that
+// says a rewind happened and nothing about what it left behind.
+func policiesPresent(snap map[string]string) []PolicyChange {
+	changes := make([]PolicyChange, 0, len(snap))
+	for path := range snap {
+		changes = append(changes, PolicyChange{Path: path, Policy: policyName(path), Action: PolicyPresent})
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	return changes
+}
+
+// pathsToValidate returns the paths that still exist at the head SHA, and so
+// can be read and parsed. Deletions are excluded: validation reads content at
+// the head SHA, where a deleted path 404s, which would turn every policy
+// deletion into a failing check run.
+func pathsToValidate(changes []PolicyChange) []string {
+	var files []string //nolint:prealloc // deletions are dropped
+	for _, c := range changes {
+		if c.Action == PolicyDeleted {
+			continue
+		}
+		files = append(files, c.Path)
+	}
+	return files
+}
 
 type Validator struct {
 	Transport *ghinstallation.AppsTransport
@@ -45,6 +353,69 @@ type Validator struct {
 	WebhookSecret [][]byte
 
 	Organizations []string
+
+	// OrgPolicyRepo is the repository name (without owner) that holds
+	// org-scoped trust policies and the org trusted-issuer allowlist.
+	// Defaults to ".github" when empty.
+	OrgPolicyRepo string
+
+	// PolicyDir is the directory, relative to the repository root, holding
+	// trust policies and the org trusted-issuer allowlist. Defaults to
+	// octosts.DefaultPolicyDir when empty.
+	PolicyDir string
+
+	// Emitter publishes trust policy audit events. Nil disables auditing.
+	Emitter *PolicyEmitter
+
+	// clients caches one client per installation ID so the transport's token is
+	// reused (~1h) instead of re-minted per event. Keyed on installation ID
+	// alone: IDs are globally unique and the webhook serves one App. Building a
+	// client is cheap (the token is minted lazily on first use), so clientsMu
+	// can guard the whole get-or-create.
+	clientsMu sync.Mutex
+	clients   *lru.Cache[int64, *github.Client]
+}
+
+func (e *Validator) policyRepo() string {
+	if e.OrgPolicyRepo != "" {
+		return e.OrgPolicyRepo
+	}
+	return ".github"
+}
+
+func (e *Validator) policyDir() string {
+	if e.PolicyDir != "" {
+		return e.PolicyDir
+	}
+	return octosts.DefaultPolicyDir
+}
+
+// prActionsThatChangeFiles is the set of pull_request actions that can alter
+// the file diff (and therefore introduce or modify a trust policy). Every other
+// action (labeled, edited, assigned, review_requested, closed, ready_for_review,
+// …) leaves the diff untouched, so there is nothing new for us to validate — we
+// don't skip drafts, so draft PRs are already validated on opened/synchronize.
+var prActionsThatChangeFiles = sets.New("opened", "synchronize", "reopened")
+
+// checkSuiteActionsToValidate and checkRunActionsToValidate are the check
+// event actions with which GitHub asks an app to run or re-run its checks.
+// Every other action, in particular created and completed, describes a check
+// run that some app has just posted. The validator posts one itself after each
+// validation, and GitHub attributes the resulting check_run events to the user
+// who triggered the suite rather than to the app, so without this filter every
+// posted check run would start another validation and the two would feed each
+// other until the installation's rate limit is exhausted.
+var (
+	checkSuiteActionsToValidate = sets.New("requested", "rerequested")
+	checkRunActionsToValidate   = sets.New("rerequested")
+)
+
+// installationClientCacheSize matches the app's other LRUs (e.g. ghinstall,
+// octosts); entries are tiny and least-recently-used installations evict first.
+const installationClientCacheSize = 200
+
+func isBotSender(sender *github.User) bool {
+	return sender != nil && sender.Login != nil && strings.HasSuffix(sender.GetLogin(), "[bot]")
 }
 
 func (e *Validator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +449,28 @@ func (e *Validator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case *github.PushEvent:
 		cr, err = e.handlePush(ctx, event)
 	case *github.CheckSuiteEvent:
+		if isBotSender(event.GetSender()) {
+			log.Infof("skipping bot-triggered check_suite from %s", event.GetSender().GetLogin())
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if !checkSuiteActionsToValidate.Has(event.GetAction()) {
+			log.Infof("skipping check_suite action %q: only requested and rerequested start a validation", event.GetAction())
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		cr, err = e.handleCheckSuite(ctx, event)
 	case *github.CheckRunEvent:
+		if isBotSender(event.GetSender()) {
+			log.Infof("skipping bot-triggered check_run from %s", event.GetSender().GetLogin())
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if !checkRunActionsToValidate.Has(event.GetAction()) {
+			log.Infof("skipping check_run action %q: only rerequested starts a validation", event.GetAction())
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		cr, err = e.handleCheckSuite(ctx, &fauxCheckSuite{event})
 	// TODO: CheckRun retry
 	default:
@@ -125,15 +516,117 @@ func (e *Validator) validatePayload(r *http.Request) ([]byte, error) {
 	return nil, errors.New("no matching secrets")
 }
 
-func (e *Validator) handleSHA(ctx context.Context, client *github.Client, owner, repo, sha string, files []string) (*github.CheckRun, error) {
+// clientForInstallation returns a cached (or freshly built) client for the
+// installation, reusing its token instead of minting one per event.
+func (e *Validator) clientForInstallation(installationID int64) (*github.Client, error) {
+	e.clientsMu.Lock()
+	defer e.clientsMu.Unlock()
+
+	if e.clients == nil {
+		cache, err := lru.New[int64, *github.Client](installationClientCacheSize)
+		if err != nil {
+			return nil, err
+		}
+		e.clients = cache
+	}
+	if client, ok := e.clients.Get(installationID); ok {
+		return client, nil
+	}
+
+	opts := []github.ClientOptionsFunc{
+		github.WithTransport(ghtransport.ForInstallation(e.Transport, installationID)),
+	}
+	if e.Transport.BaseURL != "" {
+		opts = append(opts, github.WithEnterpriseURLs(e.Transport.BaseURL, e.Transport.BaseURL))
+	}
+	client, err := github.NewClient(opts...)
+	if err != nil {
+		return nil, err
+	}
+	e.clients.Add(installationID, client)
+	return client, nil
+}
+
+// handleSHA validates the given files at sha and reports the result as a check
+// run. The returned map holds one entry per validated file (a nil value means
+// the file parsed). It is nil when no validation happened, which callers must
+// distinguish from "everything was valid".
+// validationOutcome is what handleSHA learned about a push.
+//
+// The two fields are deliberately separate from handleSHA's returned error,
+// because "something went wrong" and "what should the HTTP response be" are
+// different questions: a rate limit has to be reported on the events while
+// still answering 200: a 5xx would only mark the delivery failed in GitHub's
+// delivery log. GitHub does not retry it, so the event would be dropped unless
+// someone redelivers it, and a manual redelivery would hit the API that just
+// rate-limited us.
+type validationOutcome struct {
+	// verdicts holds one entry per file that was read: nil for a policy that
+	// parsed cleanly, otherwise its own error. A file absent from the map was
+	// never read and stays unknown.
+	verdicts map[string]error
+	// incomplete records a failure that limited how much of the push could be
+	// validated or reported. It applies to the push rather than to any one
+	// policy.
+	incomplete error
+}
+
+func (e *Validator) handleSHA(ctx context.Context, client *github.Client, owner, repo, sha string, files []string) (*github.CheckRun, validationOutcome, error) {
+	return e.handleSHAForPolicyRepo(ctx, client, owner, repo, repo, sha, files)
+}
+
+func (e *Validator) handleSHAForPolicyRepo(ctx context.Context, client *github.Client, owner, readRepo, policyRepo, sha string, files []string) (*github.CheckRun, validationOutcome, error) {
+	policyFiles := make([]policyFile, 0, len(files))
+	for _, path := range files {
+		policyFiles = append(policyFiles, policyFile{path: path, repo: policyRepo})
+	}
+	return e.handleSHAForPolicyFiles(ctx, client, owner, readRepo, sha, policyFiles)
+}
+
+type policyFile struct {
+	path string
+	repo string
+}
+
+func (e *Validator) handleSHAForPolicyFiles(ctx context.Context, client *github.Client, owner, readRepo, sha string, files []policyFile) (*github.CheckRun, validationOutcome, error) {
 	log := clog.FromContext(ctx)
 
 	// Commit doesn't exist - nothing to do.
 	if sha == zeroHash {
-		return nil, nil
+		return nil, validationOutcome{}, nil
 	}
 
-	err := validatePolicies(ctx, client, owner, repo, sha, files)
+	var results map[string]error
+	var err error
+	singleRepo := len(files) > 0
+	if singleRepo {
+		for _, file := range files[1:] {
+			if !strings.EqualFold(file.repo, files[0].repo) {
+				singleRepo = false
+				break
+			}
+		}
+	}
+	if singleRepo {
+		paths := make([]string, 0, len(files))
+		for _, file := range files {
+			paths = append(paths, file.path)
+		}
+		results, err = validatePoliciesForRepo(ctx, client, owner, readRepo, files[0].repo, sha, paths, e.policyRepo(), e.policyDir())
+	} else {
+		results, err = validatePolicyFiles(ctx, client, owner, readRepo, sha, files, e.policyRepo(), e.policyDir())
+	}
+	// If we were rate-limited, acknowledge the delivery and skip the CheckRun.
+	// Returning an error would surface as a 5xx, which marks the delivery
+	// failed in GitHub's delivery log. GitHub does not retry it automatically,
+	// so the event would be dropped unless redelivered manually.
+	if isProvenWebhookRateLimit(err) {
+		log.Warnf("rate-limited validating policies for %s/%s@%s; skipping CheckRun", owner, readRepo, sha)
+		// Files validated before the limit was hit still have real verdicts;
+		// the rest are simply absent from the map and stay unknown. The limit
+		// is carried on the events so that "unknown" comes with a reason.
+		return nil, validationOutcome{verdicts: results, incomplete: err}, nil
+	}
 	// Whether or not the commit is verified, we still create a CheckRun.
 	// The only difference is whether it shows up to the user as success or
 	// failure.
@@ -148,65 +641,172 @@ func (e *Validator) handleSHA(ctx context.Context, client *github.Client, owner,
 	}
 
 	opts := github.CreateCheckRunOptions{
-		Name:        "Trust Policy Validation",
+		Name:        checkRunName,
 		HeadSHA:     sha,
-		ExternalID:  github.Ptr(sha),
-		Status:      github.Ptr("completed"),
-		Conclusion:  github.Ptr(conclusion),
+		ExternalID:  new(sha),
+		Status:      new("completed"),
+		Conclusion:  new(conclusion),
 		StartedAt:   &github.Timestamp{Time: time.Now()},
 		CompletedAt: &github.Timestamp{Time: time.Now()},
 		Output: &github.CheckRunOutput{
-			Title:   github.Ptr(title),
-			Summary: github.Ptr(summary),
+			Title:   new(title),
+			Summary: new(summary),
 		},
 	}
 
-	cr, _, err := client.Checks.CreateCheckRun(ctx, owner, repo, opts)
+	cr, _, err := client.Checks.CreateCheckRun(ctx, owner, readRepo, opts)
 	if err != nil {
 		log.Errorf("error creating CheckRun: %v", err)
-		return nil, err
+		// The verdicts are still authoritative; only reporting them to the
+		// check run failed.
+		return nil, validationOutcome{verdicts: results, incomplete: err}, err
 	}
-	return cr, nil
+	return cr, validationOutcome{verdicts: results}, nil
 }
 
-func validatePolicies(ctx context.Context, client *github.Client, owner, repo string, sha string, files []string) error {
+// validatePoliciesForRepo reads each file from readRepo at sha, classifies it
+// using policyRepo, and returns per-file verdicts and the aggregate error used
+// for the check run. A file present in the map with a nil value parsed
+// cleanly; a file absent from the map was never read,
+// because a rate limit aborted the pass before reaching it.
+func validatePoliciesForRepo(ctx context.Context, client *github.Client, owner, readRepo, policyRepo, sha string, files []string, orgPolicyRepo, policyDir string) (map[string]error, error) {
+	policyFiles := make([]policyFile, 0, len(files))
+	for _, path := range files {
+		policyFiles = append(policyFiles, policyFile{path: path, repo: policyRepo})
+	}
+	return validatePolicyFiles(ctx, client, owner, readRepo, sha, policyFiles, orgPolicyRepo, policyDir)
+}
+
+func validatePolicyFiles(ctx context.Context, client *github.Client, owner, readRepo, sha string, files []policyFile, orgPolicyRepo, policyDir string) (map[string]error, error) {
 	var merr error
-	for _, f := range sets.List(sets.New(files...)) {
+	results := make(map[string]error, len(files))
+
+	// fail records a file's verdict and folds it into the aggregate.
+	fail := func(f string, err error) {
+		results[f] = err
+		merr = multierror.Append(merr, err)
+	}
+
+	unique := make(map[policyFile]struct{}, len(files))
+	for _, file := range files {
+		unique[file] = struct{}{}
+	}
+	ordered := make([]policyFile, 0, len(unique))
+	for file := range unique {
+		ordered = append(ordered, file)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].path == ordered[j].path {
+			return ordered[i].repo < ordered[j].repo
+		}
+		return ordered[i].path < ordered[j].path
+	})
+	contents := make(map[string]string, len(ordered))
+	for _, file := range ordered {
+		f := file.path
 		log := clog.FromContext(ctx).With("path", f)
+		raw, cached := contents[f]
+		if !cached {
+			resp, _, _, err := client.Repositories.GetContents(ctx, owner, readRepo, f, &github.RepositoryContentGetOptions{Ref: sha})
+			if err != nil {
+				log.Infof("failed to get content for: %v", err)
+				if isProvenWebhookRateLimit(err) {
+					log.Warnf("rate-limited, aborting remaining policy validations")
+					// Deliberately not recorded as a verdict: being rate-limited
+					// says nothing about whether this policy is valid, and an
+					// audit consumer must not read it as a policy failure.
+					return results, fmt.Errorf("%s: %w", f, err)
+				}
+				// A 403 without rate-limit markers is a permission failure, such
+				// as the App lacking contents access. It is a real verdict for
+				// this file, not a transient limit.
+				var errResp *github.ErrorResponse
+				if errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusForbidden {
+					fail(f, &policyReadDeniedError{path: f, err: err})
+					continue
+				}
+				fail(f, fmt.Errorf("%s: %w", f, err))
+				continue
+			}
 
-		resp, _, _, err := client.Repositories.GetContents(ctx, owner, repo, f, &github.RepositoryContentGetOptions{Ref: sha})
-		if err != nil {
-			log.Infof("failed to get content for: %v", err)
-			merr = multierror.Append(merr, fmt.Errorf("%s: %w", f, err))
-			continue
+			// GetContents returns a nil file and a populated slice when the path is a
+			// DIRECTORY, and RepositoryContent.GetContent dereferences its receiver
+			// without a nil check — so a directory named like a policy or the allowlist
+			// would panic the handler rather than fail the check run.
+			if resp == nil {
+				log.Infof("%s is not a file, skipping", f)
+				fail(f, fmt.Errorf("%s: not a file", f))
+				continue
+			}
+
+			raw, err = resp.GetContent()
+			if err != nil {
+				log.Infof("failed to read content: %v", err)
+				fail(f, fmt.Errorf("%s: %w", f, err))
+				continue
+			}
+			contents[f] = raw
 		}
 
-		raw, err := resp.GetContent()
-		if err != nil {
-			log.Infof("failed to read content: %v", err)
-			merr = multierror.Append(merr, fmt.Errorf("%s: %w", f, err))
-			continue
-		}
+		switch {
+		case strings.EqualFold(file.repo, orgPolicyRepo) && f == octosts.OrgTrustedIssuersPath(policyDir):
+			// Parse AND compile: only compiling catches uncompilable patterns,
+			// invalid issuer URLs, and an empty allowlist. The exchange path calls
+			// this same function, so the two verdicts cannot diverge.
+			if _, err := octosts.ParseOrgTrustedIssuers([]byte(raw)); err != nil {
+				log.Infof("failed to validate org trusted issuers: %v", err)
+				fail(f, fmt.Errorf("%s: %w", f, err))
+				continue
+			}
 
-		switch repo {
-		case ".github":
-			if err := yaml.UnmarshalStrict([]byte(raw), &octosts.OrgTrustPolicy{}); err != nil {
-				log.Infof("failed to parse org trust policy: %v", err)
-				merr = multierror.Append(merr, fmt.Errorf("%s: %w", f, err))
+		// EqualFold, matching the arm above: GitHub preserves repository-name case,
+		// so an org whose repo is literally ".GitHub" would otherwise fall through
+		// to the default arm and have its org policy strict-unmarshalled as a
+		// repo-level TrustPolicy — a bogus check-run failure on a valid file.
+		//
+		// Parse AND compile, as for the allowlist above: only compiling catches an
+		// uncompilable pattern, which would otherwise pass this check and fail at
+		// token exchange. lookupTrustPolicy on the exchange path does the same.
+		case strings.EqualFold(file.repo, orgPolicyRepo):
+			if err := parseAndCompile(raw, &octosts.OrgTrustPolicy{}); err != nil {
+				log.Infof("failed to validate org trust policy: %v", err)
+				fail(f, fmt.Errorf("%s: %w", f, err))
+				continue
 			}
 
 		default:
-			if err := yaml.UnmarshalStrict([]byte(raw), &octosts.TrustPolicy{}); err != nil {
-				log.Infof("failed to parse trust policy: %v", err)
-				merr = multierror.Append(merr, fmt.Errorf("%s: %w", f, err))
+			if err := parseAndCompile(raw, &octosts.TrustPolicy{}); err != nil {
+				log.Infof("failed to validate trust policy: %v", err)
+				fail(f, fmt.Errorf("%s: %w", f, err))
+				continue
 			}
+		}
+
+		// The same path can appear in a push diff and in a PR against the
+		// organization policy repository. Keep any earlier failed verdict.
+		if _, seen := results[f]; !seen {
+			results[f] = nil
 		}
 	}
 
-	return merr
+	return results, merr
 }
 
-func (e *Validator) handlePush(ctx context.Context, event *github.PushEvent) (*github.CheckRun, error) {
+// compilableTrustPolicy is satisfied by *octosts.TrustPolicy and *octosts.OrgTrustPolicy.
+type compilableTrustPolicy interface {
+	Compile() error
+}
+
+// parseAndCompile strict-unmarshals raw into tp and compiles it, so the check run
+// applies the same verdict as the token-exchange path.
+func parseAndCompile(raw string, tp compilableTrustPolicy) error {
+	if err := yaml.UnmarshalStrict([]byte(raw), tp); err != nil {
+		return err
+	}
+	return tp.Compile()
+}
+
+func (e *Validator) handlePush(ctx context.Context, event *github.PushEvent) (checkRun *github.CheckRun, err error) {
 	log := clog.FromContext(ctx).With(
 		"github/repo", event.GetRepo().GetFullName(),
 		"github/installation", event.GetInstallation().GetID(),
@@ -222,42 +822,196 @@ func (e *Validator) handlePush(ctx context.Context, event *github.PushEvent) (*g
 	sha := event.GetAfter()
 	installationID := event.GetInstallation().GetID()
 
+	ctx = ghtransport.EnrichContext(ctx, e.Transport.AppID(), installationID)
+
 	// Skip if the organization is not in the list of organizations to validate.
 	if e.shouldSkipOrganization(owner) {
 		log.Infof("skipping organization %s", owner)
 		return nil, nil
 	}
 
-	client := github.NewClient(&http.Client{
-		Transport: ghinstallation.NewFromAppsTransport(e.Transport, installationID),
-	})
-	if e.Transport.BaseURL != "" {
-		var err error
-		client, err = client.WithEnterpriseURLs(e.Transport.BaseURL, e.Transport.BaseURL)
+	client, err := e.clientForInstallation(installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// GitHub push payloads include up to 20 commits. When not truncated, use
+	// the payload directly to avoid a Compare API call. When truncated, the
+	// payload's commit list silently omits changes, so a large push would
+	// under-report both the files to validate and the policies to audit.
+	//
+	// A forced push is handled ahead of both: it can rewrite the branch to a
+	// state the commits it carries do not describe, so neither payload nor
+	// compare reports its net effect.
+	isDefaultBranch := event.GetRef() == "refs/heads/"+event.GetRepo().GetDefaultBranch()
+
+	var changes []PolicyChange
+	detection := DetectionCommits
+	var detectionErr string
+
+	switch {
+	case event.GetForced() && isDefaultBranch:
+		snapshot, live, serr := e.policyChangesFromSnapshot(ctx, client, owner, repo, event.GetBefore(), sha)
+		if serr != nil {
+			// Most often the pre-push SHA is no longer reachable, which GitHub
+			// is free to garbage collect after a rewind, so the diff cannot be
+			// computed. Record that the audit view of this push is incomplete.
+			log.Warnf("policy snapshot failed, falling back: %v", serr)
+			detection, detectionErr = DetectionDegraded, serr.Error()
+			if isProvenWebhookRateLimit(serr) {
+				// Further reads would amplify the limit. The degraded marker
+				// records the gap without posting a partial check run.
+				break
+			}
+
+			// Only before failed to resolve; the listing at the pushed SHA is
+			// still good. Report what is live rather than the commit list,
+			// which for the rewind that caused this is empty — that would
+			// leave the resurfaced policy unvalidated and unrecorded, the very
+			// gap the snapshot path exists to close.
+			if live != nil {
+				changes = policiesPresent(live)
+				break
+			}
+			changes = e.policyChangesFromPushEvent(repo, event)
+			break
+		}
+		detection = DetectionSnapshot
+		changes = snapshot
+
+	case len(event.Commits) < 20:
+		changes = e.policyChangesFromPushEvent(repo, event)
+
+	case event.GetBefore() == zeroHash:
+		changes, err = e.policyChangesFromTrees(ctx, client, owner, repo, zeroHash, sha)
 		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				log.Warnf("rate-limited discovering policies for new ref %s/%s@%s; recording degraded detection", owner, repo, sha)
+				detection, detectionErr = DetectionDegraded, err.Error()
+				break
+			}
+			return nil, err
+		}
+		detection = DetectionSnapshot
+
+	default:
+		resp, _, err := client.Repositories.CompareCommits(ctx, owner, repo, event.GetBefore(), sha, &github.ListOptions{})
+		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				detection, detectionErr = DetectionDegraded, err.Error()
+				break
+			}
+			return nil, err
+		}
+		changes, detection, err = e.completeCompareChanges(ctx, client, owner, repo, event.GetBefore(), sha, resp)
+		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				detection, detectionErr = DetectionDegraded, err.Error()
+				break
+			}
 			return nil, err
 		}
 	}
 
-	// Check diff
-	// TODO: Pagination?
-	resp, _, err := client.Repositories.CompareCommits(ctx, owner, repo, event.GetBefore(), sha, &github.ListOptions{})
-	if err != nil {
-		return nil, err
+	// Validation and auditing share one view of the push so the two can't
+	// disagree about which policies it touched.
+	files := pathsToValidate(changes)
+
+	// outcome is populated by handleSHA below; the deferred closure reads it
+	// after the fact, so a push that returns early leaves it zero and every
+	// policy is reported with an unknown verdict rather than a clean one.
+	//
+	// A degraded push is emitted even with no changes to show: the absence of
+	// events is exactly what a suppressed audit looks like, so the marker has
+	// to be published for the gap to be visible.
+	var outcome validationOutcome
+	if e.Emitter != nil && isDefaultBranch && (len(changes) > 0 || detection == DetectionDegraded) {
+		defer func() {
+			e.emitPolicyEvents(ctx, event, owner, repo, sha, installationID, changes, detection, detectionErr, outcome)
+		}()
 	}
-	var files []string
-	for _, file := range resp.Files {
-		if ok, err := filepath.Match(".github/chainguard/*.sts.yaml", file.GetFilename()); err == nil && ok {
-			if file.GetStatus() != "removed" {
-				files = append(files, file.GetFilename())
-			}
-		}
-	}
+
+	// Deletions leave nothing to read at the head SHA, so a push that only
+	// removes policies has nothing to validate — but the removals still belong
+	// in the audit trail, which the deferred emit above has already captured.
 	if len(files) == 0 {
 		return nil, nil
 	}
 
-	return e.handleSHA(ctx, client, owner, repo, sha, files)
+	checkRun, outcome, err = e.handleSHA(ctx, client, owner, repo, sha, files)
+	return checkRun, err
+}
+
+// emitPolicyEvents publishes one audit event per trust policy touched by a push
+// to the default branch, preceded by a push-level marker when change detection
+// degraded.
+//
+// outcome carries the per-file verdicts from handleSHA and may be zero or
+// partial: a policy missing from it was never read, and is reported with a nil
+// Valid so consumers can tell "unknown" from "valid".
+func (e *Validator) emitPolicyEvents(ctx context.Context, event *github.PushEvent, owner, repo, sha string, installationID int64, changes []PolicyChange, detection DetectionMethod, detectionErr string, outcome validationOutcome) {
+	base := PolicyEvent{
+		Org:            owner,
+		Repo:           repo,
+		Ref:            event.GetRef(),
+		Commit:         sha,
+		Before:         event.GetBefore(),
+		InstallationID: installationID,
+		Actor:          event.GetSender().GetLogin(),
+		ActorID:        event.GetSender().GetID(),
+		Pusher:         event.GetPusher().GetName(),
+		Forced:         event.GetForced(),
+		Detection:      detection,
+		DetectionError: detectionErr,
+		ChangeCount:    len(changes),
+	}
+	if outcome.incomplete != nil {
+		base.PushError = outcome.incomplete.Error()
+	}
+
+	// The marker carries no change: it says only that this push's change list
+	// cannot be trusted to be complete, which is a statement about the push.
+	if detection == DetectionDegraded {
+		marker := base
+		marker.Time = time.Now()
+		e.sendPolicyEvent(ctx, event, owner, repo, sha, installationID, marker)
+	}
+
+	for i, change := range changes {
+		pe := base
+		pe.Change = &change
+		pe.ChangeIndex = i
+		pe.Time = time.Now()
+		if verr, ok := outcome.verdicts[change.Path]; ok {
+			pe.Valid = new(verr == nil)
+			if verr != nil {
+				pe.Error = verr.Error()
+			}
+		}
+		e.sendPolicyEvent(ctx, event, owner, repo, sha, installationID, pe)
+	}
+}
+
+// sendPolicyEvent wraps one PolicyEvent as a CloudEvent and hands it to the
+// emitter, which delivers it asynchronously.
+func (e *Validator) sendPolicyEvent(ctx context.Context, event *github.PushEvent, owner, repo, sha string, installationID int64, pe PolicyEvent) {
+	subject := event.GetRepo().GetFullName()
+	if pe.Change != nil {
+		subject += "/" + pe.Change.Policy
+	}
+
+	ce := cloudevents.NewEvent()
+	ce.SetType("dev.octo-sts.policy")
+	ce.SetSource(fmt.Sprintf("https://github.com/%s/%s", owner, repo))
+	ce.SetSubject(subject)
+	ce.SetTime(pe.Time)
+	ce.SetExtension("githubinstallationid", strconv.FormatInt(installationID, 10))
+	ce.SetExtension("githubcommit", sha)
+	if err := ce.SetData(cloudevents.ApplicationJSON, pe); err != nil {
+		clog.FromContext(ctx).Errorf("failed to set cloudevents data: %v", err)
+		return
+	}
+	e.Emitter.Enqueue(ctx, ce)
 }
 
 func (e *Validator) handlePullRequest(ctx context.Context, pr *github.PullRequestEvent) (*github.CheckRun, error) {
@@ -275,6 +1029,7 @@ func (e *Validator) handlePullRequest(ctx context.Context, pr *github.PullReques
 	repo := pr.GetRepo().GetName()
 	sha := pr.GetPullRequest().GetHead().GetSHA()
 	installationID := pr.GetInstallation().GetID()
+	ctx = ghtransport.EnrichContext(ctx, e.Transport.AppID(), installationID)
 
 	// Skip if the organization is not in the list of organizations to validate.
 	if e.shouldSkipOrganization(owner) {
@@ -282,35 +1037,40 @@ func (e *Validator) handlePullRequest(ctx context.Context, pr *github.PullReques
 		return nil, nil
 	}
 
-	client := github.NewClient(&http.Client{
-		Transport: ghinstallation.NewFromAppsTransport(e.Transport, installationID),
-	})
-	if e.Transport.BaseURL != "" {
-		var err error
-		client, err = client.WithEnterpriseURLs(e.Transport.BaseURL, e.Transport.BaseURL)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Check diff
-	var files []string
-	resp, _, err := client.PullRequests.ListFiles(ctx, owner, repo, pr.GetNumber(), &github.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	for _, file := range resp {
-		if ok, err := filepath.Match(".github/chainguard/*.sts.yaml", file.GetFilename()); err == nil && ok {
-			if file.GetStatus() != "removed" {
-				files = append(files, file.GetFilename())
-			}
-		}
-	}
-	if len(files) == 0 {
+	// Only actions that can change the PR's file diff can introduce or modify
+	// a trust policy. Skipping the rest avoids a ListFiles call (and its token
+	// mint) on the ~99% of PR events that can't affect policy.
+	baseEdited := pr.GetAction() == "edited" && pr.GetChanges().GetBase() != nil
+	if !prActionsThatChangeFiles.Has(pr.GetAction()) && !baseEdited {
+		log.Infof("skipping pull_request action %q: cannot change file diff", pr.GetAction())
 		return nil, nil
 	}
 
-	return e.handleSHA(ctx, client, owner, repo, sha, files)
+	client, err := e.clientForInstallation(installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := e.prPolicyChanges(ctx, client, owner, repo, pr.GetNumber(), sha, owner, repo, repo)
+	if err != nil {
+		if tooLarge, ok := errors.AsType[*prTooLargeError](err); ok {
+			return e.reportPRTooLarge(ctx, client, owner, repo, sha, tooLarge)
+		}
+		if errors.Is(err, errPRHeadMismatch) || isProvenWebhookRateLimit(err) {
+			log.Warnf("skipping PR file validation: %v", err)
+			return nil, nil
+		}
+		return nil, err
+	}
+	files := pathsToValidate(changes)
+	if len(files) == 0 {
+		// Every change left is a deletion, so a non-empty list means this PR
+		// only removes policies.
+		return e.postNoPolicyChangesCheckRun(ctx, client, owner, repo, sha, len(changes) > 0)
+	}
+
+	cr, _, err := e.handleSHA(ctx, client, owner, repo, sha, files)
+	return cr, err
 }
 
 type checkSuite interface {
@@ -337,6 +1097,7 @@ func (e *Validator) handleCheckSuite(ctx context.Context, cs checkSuite) (*githu
 	repo := cs.GetRepo().GetName()
 	sha := cs.GetCheckSuite().GetHeadSHA()
 	installationID := cs.GetInstallation().GetID()
+	ctx = ghtransport.EnrichContext(ctx, e.Transport.AppID(), installationID)
 
 	// Skip if the organization is not in the list of organizations to validate.
 	if e.shouldSkipOrganization(owner) {
@@ -344,58 +1105,256 @@ func (e *Validator) handleCheckSuite(ctx context.Context, cs checkSuite) (*githu
 		return nil, nil
 	}
 
-	client := github.NewClient(&http.Client{
-		Transport: ghinstallation.NewFromAppsTransport(e.Transport, installationID),
-	})
-	if e.Transport.BaseURL != "" {
-		var err error
-		client, err = client.WithEnterpriseURLs(e.Transport.BaseURL, e.Transport.BaseURL)
-		if err != nil {
-			return nil, err
-		}
+	client, err := e.clientForInstallation(installationID)
+	if err != nil {
+		return nil, err
 	}
 
-	var files []string
+	var files []policyFile
+	// deletedPolicy records that the event removed a policy. Deletions are not
+	// validated, but they prove the repository carried policies, which matters
+	// when the last one goes and the head has no policy directory left.
+	deletedPolicy := false
 	if cs.GetCheckSuite().GetBeforeSHA() == zeroHash {
-		_, dirContents, _, err := client.Repositories.GetContents(ctx, owner, repo, ".github/chainguard", &github.RepositoryContentGetOptions{Ref: sha})
+		// New non-default branch: skip if there are no associated PRs.
+		// A feature branch points at a commit already present in the
+		// repository and doesn't need a full directory scan. This
+		// avoids reading every policy file (O(N) API calls) on every
+		// new-branch event.
+		//
+		// We still process the default branch (initial commit) and
+		// any branch with associated PRs, since those may introduce
+		// new or modified policy files.
+		defaultBranch := cs.GetRepo().GetDefaultBranch()
+		headBranch := cs.GetCheckSuite().GetHeadBranch()
+		if headBranch != defaultBranch && len(cs.GetCheckSuite().PullRequests) == 0 {
+			log.Infof("skipping new non-default branch with no PRs")
+			return nil, nil
+		}
+		// The Contents API caps a directory listing at 1,000 entries without
+		// saying so; the tree walk refuses truncated responses instead. A
+		// missing policy directory yields an empty snapshot, not an error.
+		snapshot, err := e.policyTreeSnapshot(ctx, client, owner, repo, sha)
 		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				log.Warnf("rate-limited discovering policies for check suite; skipping CheckRun: %v", err)
+				return nil, nil
+			}
 			return nil, err
 		}
-		for _, file := range dirContents {
-			files = append(files, file.GetPath())
+		if len(snapshot) == 0 {
+			log.Infof("no policies at %s, skipping validation", sha)
+		}
+		paths := make([]string, 0, len(snapshot))
+		for path := range snapshot {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		for _, path := range paths {
+			files = append(files, policyFile{path: path, repo: repo})
 		}
 	} else {
 		resp, _, err := client.Repositories.CompareCommits(ctx, owner, repo, cs.GetCheckSuite().GetBeforeSHA(), sha, &github.ListOptions{})
 		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				log.Warnf("rate-limited comparing check suite; skipping CheckRun: %v", err)
+				return nil, nil
+			}
 			return nil, err
 		}
-		for _, file := range resp.Files {
-			if ok, err := filepath.Match(".github/chainguard/*.sts.yaml", file.GetFilename()); err == nil && ok {
-				if file.GetStatus() != "removed" {
-					files = append(files, file.GetFilename())
-				}
+		changes, _, err := e.completeCompareChanges(ctx, client, owner, repo, cs.GetCheckSuite().GetBeforeSHA(), sha, resp)
+		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				log.Warnf("rate-limited discovering check suite changes; skipping CheckRun: %v", err)
+				return nil, nil
 			}
+			return nil, err
+		}
+		toValidate := pathsToValidate(changes)
+		deletedPolicy = len(changes) > len(toValidate)
+		for _, path := range toValidate {
+			files = append(files, policyFile{path: path, repo: repo})
 		}
 	}
 
 	for _, pr := range cs.GetCheckSuite().PullRequests {
-		resp, _, err := client.PullRequests.ListFiles(ctx, owner, repo, pr.GetNumber(), &github.ListOptions{})
+		prOwner, prRepo, crossRepo, err := checkSuitePRHome(pr, owner, repo)
 		if err != nil {
 			return nil, err
 		}
-		for _, file := range resp {
-			if ok, err := filepath.Match(".github/chainguard/*.sts.yaml", file.GetFilename()); err == nil && ok {
-				if file.GetStatus() != "removed" {
-					files = append(files, file.GetFilename())
-				}
+		// Content is read from the event repository, so its name decides how a
+		// file is parsed. The only exception is a PR into the same owner's
+		// policy repository, such as from a renamed fork of it. A base named
+		// like the policy repository under another owner must not upgrade
+		// classification, and a PR base must never downgrade the policy
+		// repository's own files.
+		classification := repo
+		if strings.EqualFold(prOwner, owner) && strings.EqualFold(prRepo, e.policyRepo()) {
+			classification = prRepo
+		}
+		prChanges, err := e.prPolicyChanges(ctx, client, prOwner, prRepo, pr.GetNumber(), sha, owner, repo, classification)
+		if err != nil {
+			if tooLarge, ok := errors.AsType[*prTooLargeError](err); ok {
+				return e.reportPRTooLarge(ctx, client, owner, repo, sha, tooLarge)
 			}
+			if errors.Is(err, errPRHeadMismatch) {
+				log.Warnf("PR %s/%s#%d head differs from check suite commit; skipping CheckRun: %v", prOwner, prRepo, pr.GetNumber(), err)
+				return nil, nil
+			}
+			if isProvenWebhookRateLimit(err) {
+				log.Warnf("rate-limited listing check suite PR files; skipping CheckRun: %v", err)
+				return nil, nil
+			}
+			if crossRepo && inaccessibleCrossRepoPR(err) {
+				log.Warnf("skipping inaccessible PR %s/%s#%d: %v", prOwner, prRepo, pr.GetNumber(), err)
+				continue
+			}
+			return nil, err
+		}
+		prFiles := pathsToValidate(prChanges)
+		deletedPolicy = deletedPolicy || len(prChanges) > len(prFiles)
+		for _, path := range prFiles {
+			files = append(files, policyFile{path: path, repo: classification})
 		}
 	}
 	if len(files) == 0 {
+		if cs.GetCheckSuite().GetBeforeSHA() == zeroHash && !deletedPolicy {
+			// The full directory scan above already found no policies at sha,
+			// so this repository has nothing a required check could guard.
+			return nil, nil
+		}
+		return e.postNoPolicyChangesCheckRun(ctx, client, owner, repo, sha, deletedPolicy)
+	}
+
+	cr, _, err := e.handleSHAForPolicyFiles(ctx, client, owner, repo, sha, files)
+	return cr, err
+}
+
+// postNoPolicyChangesCheckRun posts a successful check run on sha when an event
+// changed no trust policy, so that a required "Trust Policy Validation" status
+// check is present on every pull request head and not only on heads whose diff
+// touched a policy (octo-sts/app#1745).
+//
+// Callers must only reach this after change detection completed: a skipped or
+// failed detection (rate limit, PR head mismatch, listing error) is not "no
+// changes" and must never be reported as success.
+//
+// deletedPolicy reports that the event removed at least one policy and changed
+// no other. Removing a policy is a valid change: there is nothing left to
+// parse, and the exchange path fails closed for a policy that no longer
+// exists. So it concludes success too, under its own title, and skips the
+// probe below, because the deletion already proves the repository carried
+// policies even when it removed the last one along with the directory.
+//
+// It posts nothing when:
+//   - the repository holds no trust policies at sha, since a required check
+//     cannot matter there and posting would add a write to every push in every
+//     installed repository. The organization policy repository is exempt from
+//     this probe, because it is where the README recommends making the check
+//     required, and it saves the extra read there.
+//   - this app already posted a check run of the same name on sha. GitHub
+//     shows only the latest same-named run per app and commit, so posting
+//     "no changes" after a real verdict (for example a failure from a check
+//     suite whose compare touched a policy) would mask it. This also collapses
+//     the check_suite and pull_request events for one push into a single run.
+func (e *Validator) postNoPolicyChangesCheckRun(ctx context.Context, client *github.Client, owner, repo, sha string, deletedPolicy bool) (*github.CheckRun, error) {
+	log := clog.FromContext(ctx)
+
+	if sha == "" || sha == zeroHash {
 		return nil, nil
 	}
 
-	return e.handleSHA(ctx, client, owner, repo, sha, files)
+	title, summary := noPolicyChangesTitle, "No trust policy files changed, so there was nothing to validate."
+	if deletedPolicy {
+		title, summary = policiesRemovedTitle, "This change only removes trust policies, so there was nothing to validate."
+	}
+
+	if !deletedPolicy && !strings.EqualFold(repo, e.policyRepo()) {
+		has, err := e.hasPolicies(ctx, client, owner, repo, sha)
+		if err != nil {
+			if isProvenWebhookRateLimit(err) {
+				log.Warnf("rate-limited probing for policies; skipping CheckRun: %v", err)
+				return nil, nil
+			}
+			return nil, err
+		}
+		if !has {
+			return nil, nil
+		}
+	}
+
+	listOpts := &github.ListCheckRunsOptions{
+		CheckName:   new(checkRunName),
+		Filter:      new("latest"),
+		ListOptions: github.ListOptions{PerPage: 1},
+	}
+	if appID := e.Transport.AppID(); appID != 0 {
+		listOpts.AppID = new(appID)
+	}
+	existing, _, err := client.Checks.ListCheckRunsForRef(ctx, owner, repo, sha, listOpts)
+	if err != nil {
+		if isProvenWebhookRateLimit(err) {
+			log.Warnf("rate-limited listing existing check runs; skipping CheckRun: %v", err)
+			return nil, nil
+		}
+		return nil, err
+	}
+	if existing.GetTotal() > 0 {
+		log.Infof("%s already reported on %s; not posting a no-change check run", checkRunName, sha)
+		return nil, nil
+	}
+
+	now := &github.Timestamp{Time: time.Now()}
+	cr, _, err := client.Checks.CreateCheckRun(ctx, owner, repo, github.CreateCheckRunOptions{
+		Name:        checkRunName,
+		HeadSHA:     sha,
+		ExternalID:  new(sha),
+		Status:      new("completed"),
+		Conclusion:  new("success"),
+		StartedAt:   now,
+		CompletedAt: now,
+		Output: &github.CheckRunOutput{
+			Title:   new(title),
+			Summary: new(summary),
+		},
+	})
+	if err != nil {
+		log.Errorf("error creating CheckRun: %v", err)
+		return nil, err
+	}
+	return cr, nil
+}
+
+// contentsListingCap is the most entries the Contents API returns for a
+// directory. It truncates past that without saying so.
+const contentsListingCap = 1000
+
+// hasPolicies reports whether the policy directory at sha holds at least one
+// file octo-sts validates. A 404 means the directory does not exist.
+//
+// This is a single Contents call rather than the tree walk policyTreeSnapshot
+// does, because it only decides whether a no-change success is worth posting,
+// not what to validate. A listing at the Contents cap may hide policies past
+// it, so it counts as having policies: posting the no-change run is truthful
+// either way, while wrongly skipping it would leave a required check missing.
+func (e *Validator) hasPolicies(ctx context.Context, client *github.Client, owner, repo, sha string) (bool, error) {
+	policyDir := e.policyDir()
+	_, dir, resp, err := client.Repositories.GetContents(ctx, owner, repo, policyDir, &github.RepositoryContentGetOptions{Ref: sha})
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("listing %s at %s: %w", policyDir, sha, err)
+	}
+	if len(dir) >= contentsListingCap {
+		return true, nil
+	}
+	for _, f := range dir {
+		if f.GetType() == "file" && isValidatedPath(repo, f.GetPath(), e.policyRepo(), policyDir) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type fauxCheckSuite struct {
@@ -418,4 +1377,31 @@ func (e *Validator) shouldSkipOrganization(org string) bool {
 		}
 	}
 	return true
+}
+
+// isValidatedPath reports whether octo-sts validates the given file. Trust
+// policies are validated in every repository; the organization trusted-issuer
+// allowlist only in the organization's org policy repository (orgPolicyRepo).
+// Both must sit directly in policyDir.
+//
+// The repository comparison folds case because GitHub repository names are
+// case-insensitive and the exchange path resolves the repo name through the API.
+func isValidatedPath(repo, path, orgPolicyRepo, policyDir string) bool {
+	// Match "<policyDir>/*.sts.yaml" by prefix rather than with a glob, so that
+	// policyDir is taken literally whatever characters it contains.
+	if name, ok := strings.CutPrefix(path, policyDir+"/"); ok && !strings.Contains(name, "/") && strings.HasSuffix(name, ".sts.yaml") {
+		return true
+	}
+	return strings.EqualFold(repo, orgPolicyRepo) && path == octosts.OrgTrustedIssuersPath(policyDir)
+}
+
+// filterValidatedFiles returns the subset of files octo-sts validates.
+func filterValidatedFiles(repo string, files []string, orgPolicyRepo, policyDir string) []string {
+	var filtered []string
+	for _, f := range files {
+		if isValidatedPath(repo, f, orgPolicyRepo, policyDir) {
+			filtered = append(filtered, f)
+		}
+	}
+	return filtered
 }

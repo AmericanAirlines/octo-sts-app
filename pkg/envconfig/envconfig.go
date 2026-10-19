@@ -6,28 +6,88 @@ package envconfig
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
+	"github.com/octo-sts/app/pkg/oidcvalidate"
 )
 
 type EnvConfig struct {
 	Port                       int      `envconfig:"PORT" required:"true"`
 	KMSKeys                    []string `envconfig:"KMS_KEYS" required:"false"`
-	AppIDs                     []int64  `envconfig:"GITHUB_APP_IDS" required:"true"`
+	KMSProvider                string   `envconfig:"KMS_PROVIDER" required:"false" default:"gcp"`
+	AppIDs                     []int64  `envconfig:"GITHUB_APP_IDS" required:"false"`
 	AppSecretCertificateFile   string   `envconfig:"APP_SECRET_CERTIFICATE_FILE" required:"false"`
 	AppSecretCertificateEnvVar string   `envconfig:"APP_SECRET_CERTIFICATE_ENV_VAR" required:"false"`
 	Metrics                    bool     `envconfig:"METRICS" required:"false" default:"true"`
+
+	// AppConfigFile, when set, points to a YAML file describing per-org GitHub
+	// App pools. When set, the legacy GITHUB_APP_IDS / KMS_KEYS env vars are
+	// not required.
+	AppConfigFile string `envconfig:"APP_CONFIG_FILE" required:"false"`
+
+	// QuotaFloorHard / QuotaFloorSoft tune the three-tier capacity-aware
+	// picker in pkg/ghinstall. Defaults target GitHub's default 15,000/hr
+	// installation rate-limit cap: drop out of the preferred pool below
+	// ~33% remaining (5,000), exclude entirely below ~10% remaining (1,500).
+	// Operators with elevated installation tiers (50,000/hr) should raise
+	// SOFT to roughly the lowest cap in their pool so high-cap installs are
+	// preferred while they have at least one low-cap-worth of headroom.
+	QuotaFloorHard  int           `envconfig:"OCTOSTS_QUOTA_FLOOR_HARD" required:"false" default:"1500"`
+	QuotaFloorSoft  int           `envconfig:"OCTOSTS_QUOTA_FLOOR_SOFT" required:"false" default:"5000"`
+	QuotaStaleAfter time.Duration `envconfig:"OCTOSTS_QUOTA_STALE" required:"false" default:"5m"`
+
+	StickyStore                    string        `envconfig:"OCTOSTS_STICKY_STORE" required:"false"`
+	StickyStoreFirestoreProject    string        `envconfig:"OCTOSTS_STICKY_STORE_FIRESTORE_PROJECT" required:"false"`
+	StickyStoreFirestoreCollection string        `envconfig:"OCTOSTS_STICKY_STORE_FIRESTORE_COLLECTION" required:"false" default:"sticky-routes"`
+	StickyStoreFirestoreTTL        time.Duration `envconfig:"OCTOSTS_STICKY_STORE_FIRESTORE_TTL" required:"false" default:"1h"`
+
+	// GitHubBaseURL overrides the GitHub API base URL for GitHub Enterprise
+	// Server deployments (e.g. "https://github.example.com/api/v3").
+	// When empty, the default https://api.github.com is used.
+	GitHubBaseURL string `envconfig:"GITHUB_BASE_URL" required:"false"`
+
+	// AllowedIssuers, when non-empty, is the set of issuers this deployment
+	// will perform OIDC discovery against. Matching is exact, as it is for the
+	// org-level issuers list, so a trailing slash makes a different issuer.
+	//
+	// The bearer token names its own issuer and is unverified at the point
+	// discovery runs, so an unset list lets any caller choose the host this
+	// deployment connects to. Setting it confines that choice to issuers the
+	// operator has named. Leave it unset to keep accepting any issuer the
+	// trust policies allow.
+	AllowedIssuers []string `envconfig:"OCTOSTS_ALLOWED_ISSUERS" required:"false"`
 }
 
 type EnvConfigApp struct {
 	Domain          string `envconfig:"STS_DOMAIN" required:"true"`
 	EventingIngress string `envconfig:"EVENT_INGRESS_URI" required:"false"`
+	// OrgPolicyRepo is the repository name (without owner) that holds
+	// org-scoped trust policies. It applies to every organization this
+	// instance serves. Defaults to ".github". Must not be empty; setting
+	// ORG_POLICY_REPO="" is rejected at startup.
+	OrgPolicyRepo string `envconfig:"ORG_POLICY_REPO" required:"false" default:".github"`
+	// PolicyDir is the directory, relative to the repository root, that holds
+	// trust policies and the org trusted-issuer allowlist. Defaults to
+	// ".github/chainguard". The app and the webhook must agree on it.
+	PolicyDir string `envconfig:"OCTOSTS_POLICY_DIR" required:"false" default:".github/chainguard"`
 }
 
 type EnvConfigWebhook struct {
 	WebhookSecret string `envconfig:"GITHUB_WEBHOOK_SECRET" required:"true"`
 	// If set, only process events from these organizations (comma separated).
 	OrganizationFilter string `envconfig:"GITHUB_WEBHOOK_ORGANIZATION_FILTER"`
+	EventingIngress    string `envconfig:"EVENT_INGRESS_URI" required:"false"`
+	// OrgPolicyRepo is the repository name (without owner) that holds org-scoped
+	// trust policies and the org trusted-issuer allowlist. Defaults to ".github".
+	// Must not be empty; setting ORG_POLICY_REPO="" is rejected at startup.
+	OrgPolicyRepo string `envconfig:"ORG_POLICY_REPO" required:"false" default:".github"`
+	// PolicyDir is the directory, relative to the repository root, that holds
+	// trust policies and the org trusted-issuer allowlist. Defaults to
+	// ".github/chainguard". The app and the webhook must agree on it.
+	PolicyDir string `envconfig:"OCTOSTS_POLICY_DIR" required:"false" default:".github/chainguard"`
 }
 
 func AppConfig() (*EnvConfigApp, error) {
@@ -35,6 +95,13 @@ func AppConfig() (*EnvConfigApp, error) {
 
 	var err error
 	if err = envconfig.Process("", cfg); err != nil {
+		return nil, err
+	}
+
+	if cfg.OrgPolicyRepo == "" {
+		return nil, errors.New("ORG_POLICY_REPO must not be empty")
+	}
+	if err := validatePolicyDir(cfg.PolicyDir); err != nil {
 		return nil, err
 	}
 
@@ -49,7 +116,34 @@ func WebhookConfig() (*EnvConfigWebhook, error) {
 		return nil, err
 	}
 
+	if cfg.OrgPolicyRepo == "" {
+		return nil, errors.New("ORG_POLICY_REPO must not be empty")
+	}
+	if err := validatePolicyDir(cfg.PolicyDir); err != nil {
+		return nil, err
+	}
+
 	return cfg, err
+}
+
+// validatePolicyDir rejects an OCTOSTS_POLICY_DIR that does not name a
+// directory below the repository root in the form GitHub reports paths: a
+// relative, slash-separated path with no empty, "." or ".." segments. Paths
+// GitHub returns are compared against it literally, so any other spelling of
+// the same directory would silently match no policies.
+func validatePolicyDir(dir string) error {
+	if dir == "" {
+		return errors.New("OCTOSTS_POLICY_DIR must not be empty")
+	}
+	if strings.Contains(dir, `\`) {
+		return fmt.Errorf("OCTOSTS_POLICY_DIR %q must use forward slashes", dir)
+	}
+	for segment := range strings.SplitSeq(dir, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return fmt.Errorf("OCTOSTS_POLICY_DIR %q must be a relative path without empty, \".\" or \"..\" segments", dir)
+		}
+	}
+	return nil
 }
 
 func BaseConfig() (*EnvConfig, error) {
@@ -60,22 +154,64 @@ func BaseConfig() (*EnvConfig, error) {
 		return nil, err
 	}
 
-	sources := 0
-	if len(cfg.KMSKeys) > 0 {
-		sources++
-	}
-	if cfg.AppSecretCertificateFile != "" {
-		sources++
-	}
-	if cfg.AppSecretCertificateEnvVar != "" {
-		sources++
-	}
-	if sources > 1 {
-		return nil, errors.New("only one of KMS_KEYS, APP_SECRET_CERTIFICATE_FILE, APP_SECRET_CERTIFICATE_ENV_VAR may be set")
+	// Legacy env-var validation only applies when APP_CONFIG_FILE is not set.
+	if cfg.AppConfigFile == "" {
+		if len(cfg.AppIDs) == 0 {
+			return nil, errors.New("GITHUB_APP_IDS is required when APP_CONFIG_FILE is not set")
+		}
+
+		sources := 0
+		if len(cfg.KMSKeys) > 0 {
+			sources++
+		}
+		if cfg.AppSecretCertificateFile != "" {
+			sources++
+		}
+		if cfg.AppSecretCertificateEnvVar != "" {
+			sources++
+		}
+		if sources > 1 {
+			return nil, errors.New("only one of KMS_KEYS, APP_SECRET_CERTIFICATE_FILE, APP_SECRET_CERTIFICATE_ENV_VAR may be set")
+		}
+
+		if len(cfg.KMSKeys) > 0 && len(cfg.KMSKeys) != len(cfg.AppIDs) {
+			return nil, fmt.Errorf("KMS_KEYS length (%d) must match GITHUB_APP_IDS length (%d)", len(cfg.KMSKeys), len(cfg.AppIDs))
+		}
 	}
 
-	if len(cfg.KMSKeys) > 0 && len(cfg.KMSKeys) != len(cfg.AppIDs) {
-		return nil, fmt.Errorf("KMS_KEYS length (%d) must match GITHUB_APP_IDS length (%d)", len(cfg.KMSKeys), len(cfg.AppIDs))
+	if cfg.QuotaFloorHard < 0 || cfg.QuotaFloorSoft < 0 {
+		return nil, errors.New("OCTOSTS_QUOTA_FLOOR_HARD and OCTOSTS_QUOTA_FLOOR_SOFT must be non-negative")
+	}
+	if cfg.QuotaFloorSoft < cfg.QuotaFloorHard {
+		return nil, fmt.Errorf("OCTOSTS_QUOTA_FLOOR_SOFT (%d) must be >= OCTOSTS_QUOTA_FLOOR_HARD (%d)", cfg.QuotaFloorSoft, cfg.QuotaFloorHard)
+	}
+	if cfg.QuotaStaleAfter <= 0 {
+		return nil, fmt.Errorf("OCTOSTS_QUOTA_STALE (%s) must be positive", cfg.QuotaStaleAfter)
+	}
+
+	if cfg.StickyStore != "" && cfg.StickyStore != "firestore" && cfg.StickyStore != "memory" {
+		return nil, fmt.Errorf("OCTOSTS_STICKY_STORE %q is not supported (valid: memory, firestore)", cfg.StickyStore)
+	}
+	if cfg.StickyStore == "firestore" && cfg.StickyStoreFirestoreTTL <= 0 {
+		return nil, fmt.Errorf("OCTOSTS_STICKY_STORE_FIRESTORE_TTL (%s) must be positive", cfg.StickyStoreFirestoreTTL)
+	}
+
+	if cfg.GitHubBaseURL != "" {
+		u, err := url.Parse(cfg.GitHubBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("GITHUB_BASE_URL is not a valid URL: %w", err)
+		}
+		if u.Scheme != "https" {
+			return nil, fmt.Errorf("GITHUB_BASE_URL must use https scheme, got %q", u.Scheme)
+		}
+	}
+
+	// Reject an entry that no issuer can ever equal, since it would silently
+	// contribute nothing to a list whose purpose is to be exhaustive.
+	for i, iss := range cfg.AllowedIssuers {
+		if !oidcvalidate.IsValidIssuer(iss) {
+			return nil, fmt.Errorf("OCTOSTS_ALLOWED_ISSUERS[%d] is not a valid issuer: %q", i, iss)
+		}
 	}
 
 	return cfg, err

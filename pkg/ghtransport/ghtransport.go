@@ -7,55 +7,129 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
-	kms "cloud.google.com/go/kms/apiv1"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	metrics "github.com/chainguard-dev/terraform-infra-common/pkg/httpmetrics"
+	"github.com/octo-sts/app/pkg/appconfig"
 	envConfig "github.com/octo-sts/app/pkg/envconfig"
-	"github.com/octo-sts/app/pkg/gcpkms"
+	"github.com/octo-sts/app/pkg/ghinstall"
+	"github.com/octo-sts/app/pkg/kms"
 )
+
+type ctxKey int
+
+const installIDCtxKey ctxKey = 0
 
 // EnrichContext adds GitHub App and installation ID values to the context so
 // that the httpmetrics transport can label rate-limit metrics with the specific
-// installation consuming quota.
+// installation consuming quota, and so that the quota tap (if configured) can
+// attribute X-RateLimit-Remaining headers to the right installation.
 func EnrichContext(ctx context.Context, appID, installationID int64) context.Context {
 	ctx = metrics.WithGitHubAppID(ctx, appID)
 	ctx = metrics.WithGitHubInstallationID(ctx, installationID)
+	ctx = context.WithValue(ctx, installIDCtxKey, installationID)
 	return ctx
 }
 
-func New(ctx context.Context, appID int64, kmsKey string, env *envConfig.EnvConfig, kmsClient *kms.KeyManagementClient) (*ghinstallation.AppsTransport, error) {
-	switch {
-	case env.AppSecretCertificateEnvVar != "":
-		atr, err := ghinstallation.NewAppsTransport(http.DefaultTransport, appID, []byte(env.AppSecretCertificateEnvVar))
+func installationIDFromContext(ctx context.Context) int64 {
+	v, _ := ctx.Value(installIDCtxKey).(int64)
+	return v
+}
 
-		if err != nil {
-			return nil, err
-		}
-		return atr, nil
+// quotaTap is a RoundTripper that updates a QuotaStore from each response's
+// X-RateLimit-Remaining / X-RateLimit-Limit headers. Only installation-token
+// requests are recorded — app-level JWT requests return the shared app rate
+// limit (~5 000/hr) which would contaminate the per-installation store.
+//
+// ghinstallation uses "token <tok>" for installation tokens and "Bearer <jwt>"
+// for app JWTs, so we gate on the "token " prefix.
+type quotaTap struct {
+	inner http.RoundTripper
+	store *ghinstall.QuotaStore
+}
 
-	case env.AppSecretCertificateFile != "":
-		atr, err := ghinstallation.NewAppsTransportKeyFromFile(http.DefaultTransport, appID, env.AppSecretCertificateFile)
-
-		if err != nil {
-			return nil, err
-		}
-		return atr, nil
-	default:
-		if kmsKey == "" {
-			return nil, fmt.Errorf("no KMS key provided for app %d", appID)
-		}
-
-		signer, err := gcpkms.New(ctx, kmsClient, kmsKey)
-		if err != nil {
-			return nil, fmt.Errorf("error creating signer: %w", err)
-		}
-
-		atr, err := ghinstallation.NewAppsTransportWithOptions(http.DefaultTransport, appID, ghinstallation.WithSigner(signer))
-		if err != nil {
-			return nil, err
-		}
-
-		return atr, nil
+func (q *quotaTap) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := q.inner.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
 	}
+	if installID := installationIDFromContext(req.Context()); installID != 0 &&
+		strings.HasPrefix(req.Header.Get("Authorization"), "token ") {
+		remaining, rerr := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining"))
+		limit, lerr := strconv.Atoi(resp.Header.Get("X-RateLimit-Limit"))
+		if rerr == nil && lerr == nil && limit > 0 {
+			q.store.Update(installID, remaining, limit)
+		}
+	}
+	return resp, err
+}
+
+// baseTransport returns the HTTP transport used by every AppsTransport: the
+// default transport, wrapped by the httpmetrics transport for rate-limit
+// labelling, and optionally a quotaTap if a QuotaStore is provided.
+//
+// The httpmetrics wrapping ensures every GitHub response's X-RateLimit-*
+// headers populate the github_rate_limit_* metrics with the app_id and
+// installation_id labels set on the request context by EnrichContext.
+func baseTransport(quota *ghinstall.QuotaStore) http.RoundTripper {
+	base := metrics.WrapTransport(http.DefaultTransport)
+	if quota != nil {
+		base = &quotaTap{inner: base, store: quota}
+	}
+	return base
+}
+
+// NewFromAppConfig creates an AppsTransport from an appconfig.AppConfig entry.
+// Exactly one of app.PrivateKey, app.PrivateKeyFile, or app.KMSKey must be set.
+// When app.KMSKey is set, kmsClient must be a signer bound to that key
+// (constructed by the caller via kms.NewKMS so it can be closed at shutdown).
+// If quota is non-nil, response headers are tapped into the QuotaStore for
+// capacity-aware routing decisions.
+func NewFromAppConfig(_ context.Context, app appconfig.AppConfig, env *envConfig.EnvConfig, kmsClient kms.KMS, quota *ghinstall.QuotaStore) (*ghinstallation.AppsTransport, error) {
+	base := baseTransport(quota)
+
+	var atr *ghinstallation.AppsTransport
+	var err error
+	switch {
+	case app.PrivateKey != "":
+		atr, err = ghinstallation.NewAppsTransport(base, app.AppID, []byte(app.PrivateKey))
+	case app.PrivateKeyFile != "":
+		atr, err = ghinstallation.NewAppsTransportKeyFromFile(base, app.AppID, app.PrivateKeyFile)
+	default:
+		if app.KMSKey == "" {
+			return nil, fmt.Errorf("no credential source for app %d", app.AppID)
+		}
+		atr, err = ghinstallation.NewAppsTransportWithOptions(base, app.AppID, ghinstallation.WithSigner(kmsClient))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if env.GitHubBaseURL != "" {
+		atr.BaseURL = env.GitHubBaseURL
+	}
+
+	return atr, nil
+}
+
+// New creates an AppsTransport from legacy environment-variable config.
+// It delegates to NewFromAppConfig after mapping the env fields.
+func New(ctx context.Context, appID int64, kmsKey string, env *envConfig.EnvConfig, kmsClient kms.KMS, quota *ghinstall.QuotaStore) (*ghinstallation.AppsTransport, error) {
+	return NewFromAppConfig(ctx, appconfig.AppConfig{
+		AppID:          appID,
+		PrivateKey:     env.AppSecretCertificateEnvVar,
+		PrivateKeyFile: env.AppSecretCertificateFile,
+		KMSKey:         kmsKey,
+	}, env, kmsClient, quota)
+}
+
+// ForInstallation derives a per-installation Transport from a private copy of
+// base. ghinstallation's token refresh writes BaseURL and Client back into the
+// AppsTransport the Transport was derived from, so deriving directly from a
+// base shared across requests races with every other concurrent derivation.
+func ForInstallation(base *ghinstallation.AppsTransport, installationID int64) *ghinstallation.Transport {
+	clone := *base
+	return ghinstallation.NewFromAppsTransport(&clone, installationID)
 }

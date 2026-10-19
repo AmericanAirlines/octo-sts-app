@@ -113,6 +113,9 @@
         "organization_codespaces_settings": {
           "type": "string"
         },
+        "organization_copilot_metrics": {
+          "type": "string"
+        },
         "organization_copilot_seat_management": {
           "type": "string"
         },
@@ -267,6 +270,14 @@
         "permissions": {
           "$ref": "#/$defs/InstallationPermissions",
           "description": "GitHub App installation permissions to request tokens with.\nSee https://docs.github.com/en/rest/apps/apps?apiVersion=2022-11-28#create-an-installation-access-token-for-an-app"
+        },
+        "app": {
+          "type": "string",
+          "description": "App pins exchanges to one configured app (name or numeric app ID)."
+        },
+        "app_pattern": {
+          "type": "string",
+          "description": "App name regex pattern; exchanges route among matching apps."
         }
       },
       "additionalProperties": false,

@@ -60,6 +60,66 @@ locals {
   #     --algorithm rsa-sign-pkcs1-2048-sha256 \
   #     --target-key-file key.data
   kms_keys = [for app in var.github_apps : app.key_version > 0 ? "${google_kms_crypto_key.app-keys[tostring(app.app_id)].id}/cryptoKeyVersions/${app.key_version}" : ""]
+
+  # Whether multi-org routing is enabled (at least one app has org_name set).
+  multi_org_enabled = anytrue([for app in var.github_apps : app.org_name != ""])
+
+  # Group apps by org_name for YAML config generation. Org names are
+  # lowercased here so that mixed-case entries (e.g. "Octo-STS" vs
+  # "octo-sts") fail at `terraform plan` if duplicated, instead of
+  # crashing the server at startup when appconfig.Validate rejects the
+  # generated YAML.
+  org_names = distinct([for app in var.github_apps : lower(app.org_name) if app.org_name != ""])
+  apps_by_org = {
+    for org in local.org_names : org => [
+      for app in var.github_apps : {
+        app_id   = app.app_id
+        app_name = app.app_name
+        kms_key  = app.key_version > 0 ? "${google_kms_crypto_key.app-keys[tostring(app.app_id)].id}/cryptoKeyVersions/${app.key_version}" : ""
+      } if lower(app.org_name) == org
+    ]
+  }
+
+  # YAML config for multi-org routing.
+  app_config_yaml = local.multi_org_enabled ? yamlencode({
+    orgs = [for org in local.org_names : {
+      name = org
+      apps = [for app in local.apps_by_org[org] : merge(
+        {
+          app_id  = app.app_id
+          kms_key = app.kms_key
+        },
+        app.app_name != "" ? { app_name = app.app_name } : {}
+      ) if app.kms_key != ""]
+    }]
+  }) : ""
+
+  # Env vars shared by both config modes. The sticky-store settings apply
+  # regardless of how the app pools are configured — in multi-org mode the
+  # sticky store is what preserves check-run ownership across each org's
+  # multi-app pool.
+  common_env = [
+    {
+      name  = "STS_DOMAIN"
+      value = var.domain
+    },
+    {
+      name  = "OCTOSTS_STICKY_STORE"
+      value = var.sticky_store
+    },
+    {
+      name  = "OCTOSTS_STICKY_STORE_FIRESTORE_PROJECT"
+      value = var.sticky_store == "firestore" ? var.project_id : ""
+    },
+    {
+      name  = "OCTOSTS_STICKY_STORE_FIRESTORE_COLLECTION"
+      value = var.sticky_store_firestore_collection
+    },
+    {
+      name  = "OCTOSTS_STICKY_STORE_FIRESTORE_TTL"
+      value = var.sticky_store_firestore_ttl
+    },
+  ]
 }
 
 // Create a dedicated GSA for the IAM datastore service.
@@ -76,7 +136,7 @@ module "sts-emits-events" {
   for_each = var.regions
 
   source  = "chainguard-dev/common/infra//modules/authorize-private-service"
-  version = "1.0.4"
+  version = "1.59.3"
 
   project_id = var.project_id
   region     = each.key
@@ -87,7 +147,7 @@ module "sts-emits-events" {
 
 module "this" {
   source  = "chainguard-dev/common/infra//modules/regional-service"
-  version = "1.0.4"
+  version = "1.59.3"
 
   team = "developer-platform"
 
@@ -107,7 +167,12 @@ module "this" {
     "sts" = {
       image = var.images.app
       ports = [{ container_port = 8080 }]
-      env = [
+      env = concat(local.multi_org_enabled ? [
+        {
+          name  = "APP_CONFIG_FILE"
+          value = "/etc/octo-sts/config.yaml"
+        },
+        ] : [
         {
           name  = "GITHUB_APP_IDS"
           value = join(",", [for app in var.github_apps : app.app_id])
@@ -116,19 +181,72 @@ module "this" {
           name  = "KMS_KEYS"
           value = join(",", local.kms_keys)
         },
-        {
-          name  = "STS_DOMAIN",
-          value = var.domain,
-        }
-      ]
+      ], local.common_env)
       regional-env = [{
         name  = "EVENT_INGRESS_URI"
         value = { for k, v in module.sts-emits-events : k => v.uri }
       }]
+      volume_mounts = local.multi_org_enabled ? [{
+        name       = "app-config"
+        mount_path = "/etc/octo-sts"
+      }] : []
     }
   }
 
+  volumes = local.multi_org_enabled ? [{
+    name = "app-config"
+    secret = {
+      secret = google_secret_manager_secret.app-config[0].secret_id
+      items = [{
+        version = "latest"
+        path    = "config.yaml"
+      }]
+    }
+  }] : []
+
   notification_channels = var.notification_channels
+}
+
+// Store the multi-org YAML config in Secret Manager (only when multi-org is enabled).
+resource "google_secret_manager_secret" "app-config" {
+  count = local.multi_org_enabled ? 1 : 0
+
+  project   = var.project_id
+  secret_id = "${var.name}-app-config"
+
+  replication {
+    auto {}
+  }
+
+  lifecycle {
+    // Multi-org migration guards: both of these are silent runtime outages
+    // if they slip past plan (see the env rendering above and the
+    // `if app.kms_key != ""` filter in local.app_config_yaml).
+    precondition {
+      condition     = alltrue([for app in var.github_apps : app.org_name != ""])
+      error_message = "When any app sets org_name, every app must set org_name: multi-org mode stops rendering the legacy GITHUB_APP_IDS/KMS_KEYS env vars, so apps without an org_name silently stop serving. Use org_name = \"*\" for a fallback pool that serves any org."
+    }
+    precondition {
+      condition     = alltrue([for app in var.github_apps : app.key_version > 0])
+      error_message = "Every app needs key_version > 0 in multi-org mode: apps without a KMS key are dropped from the generated YAML, and an org left with no apps is rejected by config validation at startup (crash loop)."
+    }
+  }
+}
+
+resource "google_secret_manager_secret_version" "app-config" {
+  count = local.multi_org_enabled ? 1 : 0
+
+  secret      = google_secret_manager_secret.app-config[0].id
+  secret_data = local.app_config_yaml
+}
+
+resource "google_secret_manager_secret_iam_member" "app-config-accessor" {
+  count = local.multi_org_enabled ? 1 : 0
+
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.app-config[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.octo-sts.email}"
 }
 
 // Allow the STS service to call the sign method on the keys in the keyring.
@@ -235,4 +353,68 @@ resource "google_monitoring_alert_policy" "anomalous-kms-access" {
 
   enabled = "true"
   project = var.project_id
+}
+
+resource "google_logging_metric" "trust-policy-not-found" {
+  project = var.project_id
+  name    = "${var.name}-trust-policy-not-found"
+
+  filter = <<EOT
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="${var.name}"
+  textPayload=~"negative cache hit"
+  -textPayload=~"negative cache hit for {octo-sts prober does-not-exist}"
+  EOT
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+
+    labels {
+      key         = "identity"
+      value_type  = "STRING"
+      description = "The trust policy identity that was not found"
+    }
+  }
+
+  label_extractors = {
+    "identity" = "REGEXP_EXTRACT(textPayload, \"negative cache hit for \\\\{\\\\S+ \\\\S+ (\\\\S+)\\\\}\")"
+  }
+}
+
+resource "google_monitoring_alert_policy" "trust-policy-not-found" {
+  project      = var.project_id
+  display_name = "Trust Policy Not Found (>200/hr)"
+  combiner     = "OR"
+
+  alert_strategy {
+    auto_close = "3600s"
+  }
+
+  conditions {
+    display_name = "Trust policy negative cache hits exceed 200/hr"
+
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.trust-policy-not-found.name}\" AND resource.type=\"cloud_run_revision\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 200
+      duration        = "0s"
+
+      aggregations {
+        alignment_period     = "3600s"
+        per_series_aligner   = "ALIGN_SUM"
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = ["metric.labels.identity"]
+      }
+    }
+  }
+
+  documentation {
+    content   = "Trust policy identity `$${metric.labels.identity}` has exceeded 200 negative cache hits in the last hour."
+    mime_type = "text/markdown"
+  }
+
+  notification_channels = var.notification_channels
+  enabled               = true
 }

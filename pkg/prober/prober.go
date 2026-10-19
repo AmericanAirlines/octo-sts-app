@@ -9,7 +9,7 @@ import (
 
 	"chainguard.dev/sdk/sts"
 	"github.com/chainguard-dev/clog"
-	"github.com/google/go-github/v84/github"
+	"github.com/google/go-github/v88/github"
 	"github.com/kelseyhightower/envconfig"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/idtoken"
@@ -50,18 +50,23 @@ func Func(ctx context.Context) error {
 		return fmt.Errorf("exchange failed: %w", err)
 	}
 	defer func() {
-		if err := octosts.Revoke(ctx, res.AccessToken); err != nil {
+		if err := octosts.Revoke(ctx, res.AccessToken, ""); err != nil {
 			clog.WarnContextf(ctx, "failed to revoke token: %v", err)
 		}
 	}()
 
-	ghc := github.NewClient(
-		oauth2.NewClient(ctx,
-			oauth2.StaticTokenSource(&oauth2.Token{
-				AccessToken: res.AccessToken,
-			}),
+	ghc, err := github.NewClient(
+		github.WithHTTPClient(
+			oauth2.NewClient(ctx,
+				oauth2.StaticTokenSource(&oauth2.Token{
+					AccessToken: res.AccessToken,
+				}),
+			),
 		),
 	)
+	if err != nil {
+		return fmt.Errorf("creating GitHub client: %w", err)
+	}
 
 	// Check the `contents: read` permission by reading back the STS policy we
 	// used to federate.
@@ -87,8 +92,8 @@ func Func(ctx context.Context) error {
 	if _, _, err := ghc.Issues.Create(ctx,
 		"octo-sts", "prober",
 		&github.IssueRequest{
-			Title: github.Ptr("octo-sts prober was able to create an issue"),
-			Body:  github.Ptr("This should fail!"),
+			Title: new("octo-sts prober was able to create an issue"),
+			Body:  new("This should fail!"),
 		}); err == nil {
 		return fmt.Errorf("expected to fail creating an issue")
 	}

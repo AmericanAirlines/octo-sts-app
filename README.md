@@ -23,7 +23,9 @@ configured.
 
 ### The Trust Policy
 
-Trust policies are checked into `.github/chainguard/{name}.sts.yaml`, and
+Trust policies are checked into `.github/chainguard/{name}.sts.yaml` (the
+directory is configurable for self-hosted deployments; see
+[`OCTOSTS_POLICY_DIR`](#custom-policy-directory-octosts_policy_dir)), and
 consist of a few key parts:
 
 1. The claim matching criteria for federation,
@@ -35,6 +37,8 @@ Here is a simple example that allows the GitHub actions workflows in
 interact with issues:
 
 ```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/octo-sts/app/refs/heads/main/pkg/octosts/octosts.TrustPolicy.json
+
 issuer: https://token.actions.githubusercontent.com
 subject: repo:chainguard-dev/foo:ref:refs/heads/main
 
@@ -47,6 +51,8 @@ The Trust Policy can also match the issuer, subject, and even custom claims with
 regular expressions. For example:
 
 ```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/octo-sts/app/refs/heads/main/pkg/octosts/octosts.TrustPolicy.json
+
 issuer: https://accounts.google.com
 subject_pattern: "[0-9]+"
 claim_pattern:
@@ -59,22 +65,191 @@ permissions:
 This policy will allow OIDC tokens from Google accounts of folks with a
 Chainguard email address to federate and read the repo contents.
 
+Every pattern is matched against the whole value: `subject_pattern: "[0-9]+"`
+accepts `123` but not `123x`, and `refs/heads/main|refs/heads/develop` accepts
+exactly those two refs. Do not add `^` or `$` yourself.
+
 #### Autocomplete
 
 [JSONSchemas](https://json-schema.org/) are available to aid in IDE autocompletion:
 
 - [TrustPolicy](./pkg/octosts/octosts.TrustPolicy.json)
 - [OrgTrustPolicy](pkg/octosts/octosts.OrgTrustPolicy.json)
+- [OrgTrustedIssuers](pkg/octosts/octosts.OrgTrustedIssuers.json)
 
 ##### VSCode
 
-We recommend using [vscode-yaml](https://github.com/redhat-developer/vscode-yaml?tab=readme-ov-file):
+We recommend using [vscode-yaml](https://github.com/redhat-developer/vscode-yaml?tab=readme-ov-file).
+This will read the `# yaml-language-server: $schema=...` header and provide code completion.
 
-```json
-"yaml.schemas": {
-    "https://raw.githubusercontent.com/octo-sts/app/refs/heads/main/pkg/octosts/octosts.TrustPolicy.json": "/.github/chainguard/*"
-}
+### Organization Trusted Token Issuers
+
+An organization restricts which OIDC issuers can federate with its repositories.
+Add `<ORG_POLICY_REPO>/.github/chainguard/trusted-token-issuers.yaml` to the
+organization's policy repository (`.github` by default; see `ORG_POLICY_REPO`
+below). octo-sts rejects a token with an issuer that the file does not permit.
+It rejects the token before it reads the trust policy.
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ORG_POLICY_REPO` | `.github` | Repository within the organization that holds the org-issuer allowlist. Must exist and be accessible to the App before enforcement takes effect. |
+
+> **Warning: migration hazard.** If you set `ORG_POLICY_REPO=my-policies` while
+> the allowlist is still in `.github`, octo-sts reads `my-policies` instead.
+> That file does not exist yet, so the read returns 404. A 404 is treated as
+> "no allowlist" — meaning **all issuers are permitted** for that organization,
+> silently. Create or move the allowlist into the new repository and protect it
+> **before** flipping `ORG_POLICY_REPO`.
+
+> **Note: two-binary config skew.** The exchange service and the webhook
+> validator each read `ORG_POLICY_REPO` from their own deployment config. If
+> you set `ORG_POLICY_REPO` on only one of the two, the webhook validates a
+> different repository than the exchange enforces. Update both deployments
+> together.
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/octo-sts/app/refs/heads/main/pkg/octosts/octosts.OrgTrustedIssuers.json
+
+# "enforce" (the default) rejects a token that the allowlist does not permit.
+# "audit" permits them and records each one the allowlist rejects.
+mode: enforce
+
+# octo-sts matches these exactly. A trailing slash makes a different issuer.
+issuers:
+  - https://token.actions.githubusercontent.com
+  - https://accounts.google.com
+
+# octo-sts matches these as anchored regexps against the whole issuer URL.
+# Escape a literal dot. octo-sts rejects a wildcard that can match "/".
+issuer_patterns:
+  - https://oidc\.eks\.[a-z0-9-]+\.amazonaws\.com/id/[A-Z0-9]+
 ```
+
+octo-sts matches an entry in `issuers` exactly. It matches an entry in
+`issuer_patterns` as an anchored regular expression against the whole issuer URL.
+An issuer passes if it matches either list. Matching is case-sensitive, so write
+the scheme and the host in lowercase.
+
+**octo-sts rejects a pattern that can match `/`.** The `/` character separates the
+host from the path. A pattern that matches `/` can therefore reach past the host.
+Anchors at both ends do not prevent this, because a pattern can stay loose in the
+middle.
+
+octo-sts parses each pattern with the same parser that Go's `regexp` package uses.
+It then applies two rules:
+
+- It rejects a character class or a `.` that can match `/`, at any position. This
+  covers `\S`, `[^\n]`, `[[:ascii:]]` and a range such as `[.-9]`.
+- It rejects a literal `/` inside a repetition, an optional group, or an
+  alternation. A group such as `([a-z0-9.-]+/)*` repeats across separators.
+
+A literal `/` at a fixed position is correct. Every issuer with a path has one.
+
+These rules catch a common mistake: a pattern that spans into another domain.
+`https://.*.example.com` reads as "any subdomain of example.com". It also permits
+`https://evil.attacker-example.com`, because the unescaped `.` before `example`
+matches `-`. It also permits `https://totally-evil.com/x.example.com`, where an
+attacker controls the whole host.
+
+Write a literal dot as `\.`. Give an explicit character class for the part that
+varies. `https://[a-z0-9-]+\.example\.com` expresses "subdomains of example.com",
+and octo-sts accepts it. The error message names the pattern that failed.
+
+Write a path one segment at a time, with literal separators. Use
+`https://example\.com/realms/[a-z0-9-]+`. Do not use
+`https://example\.com/[a-z0-9/-]+`. octo-sts deliberately gives you no way to match
+a path of variable depth.
+
+**This is a best-effort guard, not a guarantee.** It catches accidents. It does not
+stop a determined author. Write your patterns as narrowly as you can. An
+organization owner writes this file, and the control serves that owner. An
+over-broad pattern is therefore an unwise choice, not an attack.
+
+**No file means no restriction.** An organization that adds no file sees no change.
+
+#### Rolling it out
+
+1. Commit the file with `mode: audit`. octo-sts rejects nothing in audit mode.
+2. Read the logs and the exchange events. octo-sts records each token that the
+   allowlist does not permit.
+3. Check that your list is complete.
+4. Remove the `mode` line to enforce.
+
+Audit mode does not protect you against a broken file or a failed lookup.
+
+#### Requirement: the App must be able to read the policy repository
+
+octo-sts reads the allowlist with a short-lived `contents: read` token. The token
+is scoped to the `ORG_POLICY_REPO` repository (`.github` by default).
+**Enforcement silently does not apply if octo-sts cannot read that repository.**
+The most common cause is an App that is installed on selected repositories only.
+
+octo-sts cannot report which cause it hit. GitHub answers a token request for an
+inaccessible repository with one 422 status. That status does not separate "the
+repository does not exist" from "you do not have access".
+
+Grant the App access to the policy repository before you rely on this control.
+
+#### When the lookup fails
+
+| Situation | Result |
+| --- | --- |
+| File absent | octo-sts permits all issuers |
+| No App can read `ORG_POLICY_REPO` | octo-sts permits all issuers and logs a warning. It first re-reads the installation list from GitHub, without its local cache. See effect 4 below |
+| Rate limited, or GitHub unavailable | octo-sts uses the last known good allowlist. If there is none, it rejects the exchange |
+| File present but invalid | octo-sts uses the last known good allowlist. If there is none, it rejects every exchange in the organization |
+
+This caching creates four timing effects.
+
+1. After you *narrow* the allowlist, octo-sts can still serve the previous, broader
+   list for up to one hour. This happens whenever GitHub returns an error.
+2. After you *fix* an invalid file, rejections can continue for up to five minutes.
+   The cached result must expire first.
+3. When you *enable* the allowlist, octo-sts can permit all issuers for up to one
+   hour.
+4. After you install the App, enforcement can take a few minutes to start.
+
+Plan for effect 3. "No file" is itself a valid last known good state. An
+organization that adds its **first** allowlist during a GitHub incident can
+therefore keep permitting all issuers for up to one hour. This behavior is
+deliberate. It keeps the organizations that do not use this feature working through
+the incident. One successful read replaces the state. Check that enforcement
+started. Do not assume it started.
+
+Effect 4 has a different cause. Before octo-sts concludes that no installation can
+read the policy repository, it re-reads the installation list from GitHub without
+its local cache. GitHub does not list a new installation at once. octo-sts cannot
+see an installation that GitHub has not yet propagated.
+
+#### Hardening
+
+This control is only as strong as write access to the policy repository.
+
+- **Create the policy repository before you need it.** GitHub does not reserve
+  repository names. In an organization without this repository, any member who can
+  create a repository becomes the sole author of this control. Restrict who can
+  create repositories.
+
+- **Protect the default branch of the policy repository.** Make the
+  `Trust Policy Validation` check a **required** status check. The check validates
+  this file on every pull request. It only reports. It blocks nothing until you make
+  it required. When a push changes no trust policy, the check still reports success
+  with the title `No trust policy changes.`, so the required check is present on
+  every pull request head. Outside the policy repository, this no-change result only
+  appears in repositories that have trust policies under `.github/chainguard`.
+
+- **Add a CODEOWNERS entry** for the file.
+
+- **Scope organization-level trust policies with `repositories:`.** An
+  organization-level policy that grants `contents: write` without a `repositories:`
+  restriction covers every repository the installation can see. That includes the
+  policy repository. A federated identity can then rewrite the allowlist that
+  constrains it. Any permission that writes, renames, or deletes the allowlist file
+  defeats this control. **Deletion of the file fails open.**
+
+- **`.github-private` is not consulted.** The file must live in `ORG_POLICY_REPO`.
 
 ### Federating a token
 
@@ -95,8 +270,271 @@ policy.
 
 ### Release cadence
 
-Our release cadence at this moment is set to when is needed, meaning if we have a bug fix or a new feature
-we will might make a new release.
+We cut a release when there is a bug fix or feature to ship. Changes reach
+each environment as follows:
+
+- Merging to `main` deploys staging.
+- Pushing a `v*` tag publishes the container images.
+- Publishing a release (not a pre-release) for a `vX.Y.Z` tag deploys
+  production. Pre-releases and tag pushes without a published release do not
+  deploy.
+- To roll back production, run the `deploy-prod.yaml` workflow manually against
+  the previous version tag.
+
+### Container images
+
+For self-hosting, container images are published to
+`ghcr.io/octo-sts/app` and `ghcr.io/octo-sts/webhook`. A release tagged `vX.Y.Z`
+is pushed as `X.Y.Z` and `latest`.
+
+Images are signed keylessly with [cosign](https://github.com/sigstore/cosign),
+using the GitHub Actions workflow that built them as the signing identity. Verify
+one before use:
+
+```shell
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/octo-sts/app/\.github/workflows/container\.yaml@refs/tags/v.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/octo-sts/app:latest
+```
+
+### Multi-App Routing
+
+When multiple GitHub Apps are configured (`GITHUB_APP_IDS` has more than one
+entry), OctoSTS distributes token exchanges across installations using
+capacity-aware fairshare routing. Trust policies with `checks: write` require
+sticky routing — the same `(scope, identity)` pair must always receive a token
+from the same installation because GitHub check runs can only be updated by the
+app that created them.
+
+#### Sticky Store
+
+The sticky store persists these `(scope, identity) -> installation` mappings so
+they survive process restarts and deploys. Without it, checks:write policies fall
+back to round-robin (non-sticky) routing which may break check-run updates.
+
+**Firestore backend** (recommended for GCP deployments):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OCTOSTS_STICKY_STORE` | (empty) | Set to `firestore` to enable |
+| `OCTOSTS_STICKY_STORE_FIRESTORE_PROJECT` | running GCP project | Firestore GCP project |
+| `OCTOSTS_STICKY_STORE_FIRESTORE_COLLECTION` | `sticky-routes` | Firestore collection name |
+| `OCTOSTS_STICKY_STORE_FIRESTORE_TTL` | `1h` | TTL for inactive mappings |
+
+Active mappings have their TTL refreshed on every use, so they never expire.
+Only mappings unused for the TTL duration are automatically cleaned up.
+
+Single-app deployments (`GITHUB_APP_IDS` has one entry) do not need sticky
+routing and can ignore these settings.
+
+#### Multi-Org Routing (`APP_CONFIG_FILE`)
+
+By default the Apps in `GITHUB_APP_IDS` / `KMS_KEYS` form a single flat pool
+that serves every org. To assign dedicated Apps to specific GitHub
+organizations — e.g. to use different credential types per org — point
+`APP_CONFIG_FILE` at a YAML file that maps orgs to their App pools:
+
+```yaml
+orgs:
+  # A dedicated pool for org-a (two Apps, KMS credentials).
+  - name: org-a
+    apps:
+      - app_id: 111
+        kms_key: projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1
+      - app_id: 112
+        kms_key: projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/2
+
+  # A dedicated pool for org-b using an injected PEM instead of KMS.
+  - name: org-b
+    apps:
+      - app_id: 222
+        private_key: ${ORG_B_APP_PEM}
+
+  # Optional catch-all: "*" serves any org not listed above.
+  - name: "*"
+    apps:
+      - app_id: 999
+        private_key_file: /etc/octo-sts/keys/fallback.pem
+```
+
+Each app sets **exactly one** credential source:
+
+| Field | Description |
+|-------|-------------|
+| `kms_key` | KMS key identifier, interpreted per `KMS_PROVIDER` (default `gcp`; also `aws`, `akv`) |
+| `private_key` | An inline PEM |
+| `private_key_file` | Path to a PEM file |
+
+String values support `${VAR}` expansion from the process environment. Only
+the braced form expands — bare `$VAR` references and literal `$` characters
+pass through unchanged (so PEMs and values containing `$` are safe).
+
+Notes:
+
+- When `APP_CONFIG_FILE` is set, the legacy `GITHUB_APP_IDS` / `KMS_KEYS` env
+  vars are ignored.
+- A request for an org with no matching pool and no `"*"` fallback is rejected
+  (fail closed), not served by an arbitrary App.
+- With `APP_CONFIG_FILE` unset, behavior is unchanged (a single flat pool
+  serving every org).
+- Each org's pool does its own capacity-aware routing, and the sticky store
+  settings above apply across all pools — configure the sticky store if any
+  org has more than one App and uses `checks: write` policies.
+- If you deploy with the bundled terraform module, set `org_name` on each
+  entry in `github_apps` and the module generates this config for you. Setting
+  `org_name` on any app requires it on all of them (use `"*"` for a fallback
+  pool), and every app needs a KMS key (`key_version > 0`); both are enforced
+  at `terraform plan` time.
+
+#### App Pinning (trust policy `app` / `app_pattern`)
+
+By default a multi-App pool load-balances exchanges across its installations.
+Some workloads need one *specific* App — different permission grants, a
+dedicated rate limit, or deterministic check-run ownership. A trust policy can
+pin the App that mints its tokens:
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/octo-sts/app/refs/heads/main/pkg/octosts/octosts.TrustPolicy.json
+issuer: https://token.actions.githubusercontent.com
+subject: repo:my-org/my-repo:ref:refs/heads/main
+
+permissions:
+  contents: read
+  checks: write
+
+# Exactly one of:
+app: reviewer-bot     # a configured app name, or a numeric app ID
+# app_pattern: ci-.*  # route among all apps whose name matches (anchored)
+```
+
+Apps are named with the optional `app_name` field in `APP_CONFIG_FILE`
+entries:
+
+```yaml
+orgs:
+  - name: org-a
+    apps:
+      - app_id: 111
+        app_name: reviewer-bot
+        kms_key: projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1
+```
+
+Unnamed apps (and legacy `GITHUB_APP_IDS` deployments) can still be pinned by
+numeric app ID. Names must be unique and non-numeric; with the terraform
+module, set `app_name` on `github_apps` entries — uniqueness, non-numeric
+names, and the org-mode requirement are enforced at `terraform plan` time.
+
+Routing semantics:
+
+- Selection precedence is: policy pin, then the sticky mapping (for
+  `checks: write`), then the installation that read the policy. Policies
+  without a pin behave exactly as before.
+- `app` selects one App from the target organization's pool. `app_pattern`
+  selects apps in that pool whose names match the anchored regexp;
+  exchanges then use the same
+  capacity-aware selection as unpinned routing. Policies with `checks: write`
+  instead pick deterministically within the matched set, independent of App
+  configuration order — with or without a sticky store — so check-run
+  ownership stays on one App.
+- Pins fail closed with `FailedPrecondition` rather than silently re-routing:
+  an unknown name or ID, a pattern matching no configured app, or a pinned
+  App not installed on the target org all reject the exchange. A newly
+  installed App is picked up within about a minute.
+
+Notes:
+
+- Deploy new `app`/`webhook` binaries **before** any policy uses `app:` or
+  any config uses `app_name:` — older binaries reject unknown fields (the
+  webhook fails the check run; the exchange returns an error).
+- The webhook PR check validates pin syntax (the `app`/`app_pattern` oneof
+  and regexp validity) but has no access to server configuration, so a pin
+  naming a nonexistent App passes the check and fails at exchange time.
+- Changing or narrowing a pin reassigns sticky mappings that fall outside the
+  new set; check runs created by the previously assigned App can no longer be
+  updated by the new one. Symmetrically, installing an additional App matched
+  by an `app_pattern` can remap `checks: write` callers in deployments without
+  a sticky store once the new App becomes visible.
+- Upgrading from routing based on App configuration order to canonical ordering
+  can remap existing `checks: write` pattern routes once when no sticky store
+  is configured. Existing eligible sticky assignments are preserved.
+- A pinned App forfeits load balancing: its installation absorbs all of that
+  policy's traffic and downstream token usage. That dedicated rate limit is
+  usually the point — but budget for it.
+
+### GitHub Enterprise Server (GHES)
+
+OctoSTS can be deployed against a GitHub Enterprise Server instance by setting
+the `GITHUB_BASE_URL` environment variable to your GHES API endpoint:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_BASE_URL` | (empty — uses `https://api.github.com`) | GitHub API base URL for GHES (e.g. `https://github.example.com/api/v3`) |
+
+The URL must use HTTPS. When set, all GitHub API interactions (installation
+lookups, trust policy reads, token exchanges, and token revocations) will target
+the configured endpoint instead of the public GitHub API.
+
+Note that `GITHUB_BASE_URL` does not affect OIDC discovery, which targets the
+issuer named by the presented token. A GHES deployment whose issuer is not
+reachable from the public internet should name it in `OCTOSTS_ALLOWED_ISSUERS`,
+described below.
+
+### Custom policy directory (`OCTOSTS_POLICY_DIR`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OCTOSTS_POLICY_DIR` | `.github/chainguard` | Directory, relative to the repository root, that holds trust policies and the org trusted-issuer allowlist. |
+
+A self-hosted deployment can read policies from a different directory, for
+example:
+
+```sh
+OCTOSTS_POLICY_DIR=.github/octo-sts
+```
+
+Trust policies are then read from `.github/octo-sts/{name}.sts.yaml` and the
+org allowlist from `<ORG_POLICY_REPO>/.github/octo-sts/trusted-token-issuers.yaml`.
+
+The value must be a relative, slash-separated path without a leading or
+trailing slash and without `.` or `..` segments. The process refuses to start
+otherwise.
+
+> **Note: two-binary config skew.** As with `ORG_POLICY_REPO`, the exchange
+> service and the webhook validator each read `OCTOSTS_POLICY_DIR` from their
+> own deployment config. Set it on both, or the webhook validates a different
+> directory than the exchange reads.
+
+### Restricting issuers (`OCTOSTS_ALLOWED_ISSUERS`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OCTOSTS_ALLOWED_ISSUERS` | (empty — any issuer) | Comma-separated issuers this deployment will perform OIDC discovery against. |
+
+A token names its own issuer, and octo-sts must fetch that issuer's discovery
+document to learn the keys that verify the token. The fetch therefore happens
+while the token is still unverified, which means a caller who has presented
+nothing but an unsigned assertion chooses a host this deployment connects to.
+
+Setting `OCTOSTS_ALLOWED_ISSUERS` confines that choice to issuers you name:
+
+```sh
+OCTOSTS_ALLOWED_ISSUERS=https://token.actions.githubusercontent.com
+```
+
+Matching is exact, as it is for the org-level `issuers` list, so a trailing
+slash makes a different issuer. Each entry is validated at startup and the
+process refuses to start if one could never match a valid issuer.
+
+Entries should be separated by commas without whitespace. Including whitespace
+will cause the app to fail to start up with a warning that
+OCTOSTS_ALLOWED_ISSUERS contains an entry that is not a valid issuer.
+
+Leave it unset to keep accepting any issuer your trust policies allow. Most
+deployments federate a small, fixed set of identity providers and can name them
+all; a deployment serving organizations that bring their own issuers, or one
+using `issuer_patterns`, will want to leave it unset and rely on the trust
+policy and the org-level allowlist instead.
 
 ### Best Practices
 
@@ -107,6 +545,8 @@ To ensure secure and effective use of octo-sts, follow these recommended practic
 - **Enable branch protection**: Configure branch protection rules on your main/default branch to prevent direct commits and require pull request reviews before merging changes. This prevents OctoSTS clients from bypassing security controls by directly merging changes to main without review.
 
 - **Restrict who can approve pull requests**: Limit pull request approval permissions to trusted team members or repository administrators.
+
+- **Restrict trusted token issuers**: Use the [organization-wide allowlist](#organization-trusted-token-issuers) so that only approved identity providers can federate with your repositories. Without it, anyone who can write a trust policy can point `issuer:` at a provider they control.
 
 ### Trust Policy Management
 
